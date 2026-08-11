@@ -1,0 +1,92 @@
+name: llama.cpp - Snapdragon SM8850 OpenCL + Hexagon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+
+      - name: Build Snapdragon Android backend
+        run: |
+          set -eux
+
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            ghcr.io/snapdragon-toolchain/arm64-android:v0.7 \
+            bash -lc '
+              set -eux
+
+              cp docs/backend/snapdragon/CMakeUserPresets.json .
+
+              cmake \
+                --preset arm64-android-snapdragon-release \
+                -B build-snapdragon
+
+              cmake \
+                --build build-snapdragon \
+                -j$(nproc)
+
+              rm -rf pkg-snapdragon
+
+              cmake \
+                --install build-snapdragon \
+                --prefix pkg-snapdragon/llama.cpp
+            '
+
+      - name: Verify OpenCL + Hexagon
+        run: |
+          set -eux
+
+          echo "===== libraries ====="
+
+          find pkg-snapdragon/llama.cpp/lib \
+            -maxdepth 1 \
+            -type f \
+            -printf "%f\n" \
+            | sort
+
+          echo
+          echo "===== required libraries ====="
+
+          test -f \
+            pkg-snapdragon/llama.cpp/lib/libggml-opencl.so
+
+          test -f \
+            pkg-snapdragon/llama.cpp/lib/libggml-hexagon.so
+
+          test -f \
+            pkg-snapdragon/llama.cpp/lib/libggml-cpu.so
+
+          echo "OpenCL: OK"
+          echo "Hexagon: OK"
+          echo "CPU: OK"
+
+      - name: Show HTP libraries
+        run: |
+          ls -lh \
+            pkg-snapdragon/llama.cpp/lib/libggml-htp-*.so
+
+      - name: Package
+        run: |
+          tar \
+            -C pkg-snapdragon \
+            -czf llama.cpp-sm8850-opencl-hexagon.tar.gz \
+            llama.cpp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-sm8850-opencl-hexagon
+          path: llama.cpp-sm8850-opencl-hexagon.tar.gz
+          retention-days: 30
