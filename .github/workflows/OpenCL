@@ -1,0 +1,155 @@
+name: Build llama.cpp Android OpenCL Adreno
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    env:
+      NDK_VERSION: "26.3.11579264"
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            python3
+
+      # ---------------------------------------------------------
+      # OpenCL headers
+      # ---------------------------------------------------------
+      - name: Install OpenCL Headers
+        run: |
+          git clone --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-Headers.git \
+            "$RUNNER_TEMP/OpenCL-Headers"
+
+          mkdir -p \
+            "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+
+          cp -r \
+            "$RUNNER_TEMP/OpenCL-Headers/CL" \
+            "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+
+      # ---------------------------------------------------------
+      # OpenCL ICD Loader
+      # ---------------------------------------------------------
+      - name: Build OpenCL ICD Loader
+        run: |
+          git clone --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-ICD-Loader.git \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader"
+
+          cmake \
+            -S "$RUNNER_TEMP/OpenCL-ICD-Loader" \
+            -B "$RUNNER_TEMP/OpenCL-ICD-Loader/build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static
+
+          cmake --build "$RUNNER_TEMP/OpenCL-ICD-Loader/build" \
+            --parallel 2
+
+          cp \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader/build/libOpenCL.so" \
+            "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/"
+
+      # ---------------------------------------------------------
+      # Configure llama.cpp
+      # ---------------------------------------------------------
+      - name: Configure llama.cpp
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DANDROID_STL=c++_static \
+            -DBUILD_SHARED_LIBS=OFF \
+            \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DGGML_OPENCL_PROFILING=ON \
+            \
+            -DGGML_HEXAGON=OFF \
+            -DGGML_VULKAN=OFF \
+            \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=ON
+
+      # ---------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------
+      - name: Build llama.cpp
+        run: |
+          cmake --build build \
+            --config Release \
+            --parallel 2
+
+      # ---------------------------------------------------------
+      # Check binaries
+      # ---------------------------------------------------------
+      - name: Check build
+        run: |
+          find build -type f \
+            \( -name "llama-cli" \
+            -o -name "llama-bench" \
+            -o -name "llama-server" \) \
+            -print
+
+      # ---------------------------------------------------------
+      # Package
+      # ---------------------------------------------------------
+      - name: Package Termux build
+        run: |
+          mkdir -p package/bin
+
+          find build -type f -name "llama-cli" \
+            -exec cp {} package/bin/ \;
+
+          find build -type f -name "llama-bench" \
+            -exec cp {} package/bin/ \;
+
+          find build -type f -name "llama-server" \
+            -exec cp {} package/bin/ \;
+
+          chmod +x package/bin/*
+
+          cat > package/setup.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="/vendor/lib64:$BASE/lib:$LD_LIBRARY_PATH"
+
+          echo "llama.cpp OpenCL Adreno"
+          echo
+          echo "Devices:"
+          "$BASE/bin/llama-cli"
