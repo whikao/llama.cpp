@@ -152,4 +152,56 @@ jobs:
           echo "llama.cpp OpenCL Adreno"
           echo
           echo "Devices:"
-          "$BASE/bin/llama-cli"
+          "$BASE/bin/llama-cli" --list-devices
+          EOF
+
+          chmod +x package/setup.sh
+
+          cat > package/run-qwen.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="/vendor/lib64:$BASE/lib:$LD_LIBRARY_PATH"
+
+          MODEL="/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+
+          exec "$BASE/bin/llama-cli" \
+            --device GPUOpenCL \
+            -m "$MODEL" \
+            -c 1024 \
+            -t 4 \
+            -n 128 \
+            -p "你好，请用中文介绍一下你自己。"
+          EOF
+
+          chmod +x package/run-qwen.sh
+
+          cat > package/benchmark.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="/vendor/lib64:$BASE/lib:$LD_LIBRARY_PATH"
+
+          MODEL="/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+
+          exec "$BASE/bin/llama-bench" \
+            --device GPUOpenCL \
+            -m "$MODEL" \
+            -p 512 \
+            -n 128
+          EOF
+
+          chmod +x package/benchmark.sh
+
+          tar -czf \
+            llama.cpp-android-opencl-adreno.tar.gz \
+            package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-android-opencl-adreno
+          path: llama.cpp-android-opencl-adreno.tar.gz
+          retention-days: 14
