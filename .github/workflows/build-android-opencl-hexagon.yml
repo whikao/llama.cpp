@@ -1,0 +1,309 @@
+name: Build llama.cpp Android CPU OpenCL Hexagon
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    env:
+      NDK_VERSION: "26.3.11579264"
+      HEXSDK_VER: "6.4.0.2"
+      HEXTLS_VER: "19.0.04"
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            python3 \
+            curl \
+            xz-utils
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------
+      # OpenCL headers
+      # ---------------------------------------------------------
+      - name: Install OpenCL Headers
+        run: |
+          git clone --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-Headers.git \
+            "$RUNNER_TEMP/OpenCL-Headers"
+
+          mkdir -p \
+            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
+
+          cp -r \
+            "$RUNNER_TEMP/OpenCL-Headers/CL" \
+            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/"
+
+      # ---------------------------------------------------------
+      # OpenCL ICD Loader
+      # ---------------------------------------------------------
+      - name: Build OpenCL ICD Loader
+        run: |
+          git clone --depth 1 \
+            https://github.com/KhronosGroup/OpenCL-ICD-Loader.git \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader"
+
+          cmake \
+            -S "$RUNNER_TEMP/OpenCL-ICD-Loader" \
+            -B "$RUNNER_TEMP/OpenCL-ICD-Loader/build" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DOPENCL_ICD_LOADER_HEADERS_DIR="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=31 \
+            -DANDROID_STL=c++_shared
+
+          cmake --build \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader/build" \
+            --parallel 2
+
+          sudo cp \
+            "$RUNNER_TEMP/OpenCL-ICD-Loader/build/libOpenCL.so" \
+            "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/"
+
+      # ---------------------------------------------------------
+      # Hexagon SDK
+      # This follows the Hexagon SDK installation used by the
+      # llama.cpp Android Hexagon CI workflow.
+      # ---------------------------------------------------------
+      - name: Install Hexagon SDK
+        run: |
+          curl -L \
+            -o hexagon-sdk.tar.xz \
+            "https://github.com/snapdragon-toolchain/hexagon-sdk/releases/download/v${HEXSDK_VER}/hexagon-sdk-v${HEXSDK_VER}-amd64-lnx.tar.xz"
+
+          mkdir -p hex-sdk
+          tar -xaf hexagon-sdk.tar.xz -C hex-sdk
+
+          echo "=== Hexagon SDK archive ==="
+          find hex-sdk -maxdepth 2 -type d | head -50
+
+          sudo rm -rf /opt/hexagon
+          sudo mkdir -p /opt/hexagon
+          sudo cp -a hex-sdk/. /opt/hexagon/
+
+          echo "HEXAGON_SDK_ROOT=/opt/hexagon/${HEXSDK_VER}" >> "$GITHUB_ENV"
+
+          echo "=== HEXAGON_SDK_ROOT ==="
+          ls -la "/opt/hexagon/${HEXSDK_VER}"
+
+      # ---------------------------------------------------------
+      # Configure llama.cpp
+      # ---------------------------------------------------------
+      - name: Configure llama.cpp
+        run: |
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=31 \
+            -DANDROID_STL=c++_shared \
+            -DBUILD_SHARED_LIBS=OFF \
+            \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            \
+            -DGGML_OPENCL=ON \
+            -DGGML_OPENCL_USE_ADRENO_KERNELS=ON \
+            -DGGML_OPENCL_EMBED_KERNELS=ON \
+            -DGGML_OPENCL_PROFILING=ON \
+            \
+            -DGGML_HEXAGON=ON \
+            -DHEXAGON_SDK_ROOT="$HEXAGON_SDK_ROOT" \
+            \
+            -DGGML_VULKAN=OFF \
+            \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=ON \
+            -DLLAMA_BUILD_SERVER=ON
+
+      # ---------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------
+      - name: Build llama.cpp
+        run: |
+          cmake --build build \
+            --config Release \
+            --parallel 2
+
+      # ---------------------------------------------------------
+      # Verify build outputs
+      # ---------------------------------------------------------
+      - name: Check build
+        run: |
+          echo "=== binaries ==="
+          find build -type f \
+            \( -name "llama-cli" \
+            -o -name "llama-bench" \
+            -o -name "llama-server" \) \
+            -print
+
+          echo
+          echo "=== OpenCL libraries ==="
+          find build -type f \
+            \( -name "libggml-opencl.so" \
+            -o -name "*opencl*.so" \) \
+            -print
+
+          echo
+          echo "=== Hexagon libraries ==="
+          find build -type f \
+            \( -name "libggml-hexagon.so" \
+            -o -name "libggml-htp-v81.so" \
+            -o -name "libggml-htp-*.so" \) \
+            -print
+
+      # ---------------------------------------------------------
+      # Package
+      # ---------------------------------------------------------
+      - name: Package Termux build
+        run: |
+          set -e
+
+          rm -rf package
+          mkdir -p package/bin package/lib
+
+          find build -type f -name "llama-cli" \
+            -exec cp {} package/bin/ \;
+
+          find build -type f -name "llama-bench" \
+            -exec cp {} package/bin/ \;
+
+          find build -type f -name "llama-server" \
+            -exec cp {} package/bin/ \;
+
+          # Copy all backend/runtime shared libraries produced by the build.
+          find build -type f -name "*.so" \
+            -exec cp -n {} package/lib/ \; || true
+
+          chmod +x package/bin/*
+
+          cat > package/setup.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${ADSP_LIBRARY_PATH:-}"
+
+          echo "llama.cpp Android CPU + OpenCL + Hexagon"
+          echo
+          echo "Devices:"
+          "$BASE/bin/llama-cli" --list-devices
+          EOF
+
+          chmod +x package/setup.sh
+
+          cat > package/check-devices.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${ADSP_LIBRARY_PATH:-}"
+
+          exec "$BASE/bin/llama-cli" --list-devices
+          EOF
+
+          chmod +x package/check-devices.sh
+
+          cat > package/run-qwen-opencl.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${ADSP_LIBRARY_PATH:-}"
+
+          MODEL="/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+
+          exec "$BASE/bin/llama-cli" \
+            --device GPUOpenCL \
+            -ngl auto \
+            -c 128 \
+            -t 4 \
+            -n 128 \
+            -v \
+            -m "$MODEL" \
+            -p "你好，请详细介绍一下你自己，以及你擅长处理哪些类型的问题。"
+          EOF
+
+          chmod +x package/run-qwen-opencl.sh
+
+          cat > package/run-htp.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${ADSP_LIBRARY_PATH:-}"
+
+          MODEL="${1:-/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}"
+
+          exec "$BASE/bin/llama-cli" \
+            --device HTP0 \
+            -ngl auto \
+            -c 128 \
+            -t 4 \
+            -n 8 \
+            -v \
+            -m "$MODEL" \
+            -p "你好"
+          EOF
+
+          chmod +x package/run-htp.sh
+
+          cat > package/benchmark.sh <<'EOF'
+          #!/data/data/com.termux/files/usr/bin/bash
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:/vendor/lib64:${ADSP_LIBRARY_PATH:-}"
+
+          MODEL="/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+
+          exec "$BASE/bin/llama-bench" \
+            --device GPUOpenCL \
+            -m "$MODEL" \
+            -p 512 \
+            -n 128
+          EOF
+
+          chmod +x package/benchmark.sh
+
+          tar -czf \
+            llama.cpp-android-opencl-hexagon.tar.gz \
+            package
+
+      # ---------------------------------------------------------
+      # Upload artifact
+      # ---------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-android-opencl-hexagon
+          path: llama.cpp-android-opencl-hexagon.tar.gz
+          if-no-files-found: error
+          retention-days: 14
