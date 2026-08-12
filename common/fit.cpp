@@ -114,12 +114,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
-        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
-        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
-        // not assign anything to a device with an unknown memory budget.
+        // Hexagon uses UMA (unified memory), so HTP can use host memory as a fallback.
         if (free == 0 && total == 0) {
             const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            const std::string dev_name = ggml_backend_dev_name(dev);
+            const bool is_htp = dev_name.rfind("HTP", 0) == 0;
+            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && !is_htp) {
                 LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
                         __func__, ggml_backend_dev_name(dev));
             } else {
