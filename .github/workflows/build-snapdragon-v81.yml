@@ -1,0 +1,155 @@
+name: Build Android Snapdragon OpenCL + Hexagon v81
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/snapdragon-toolchain/arm64-android:v0.7
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      # Official Snapdragon build uses the official CMakeUserPresets.json.
+      - name: Prepare official Snapdragon preset
+        run: |
+          cp docs/backend/snapdragon/CMakeUserPresets.json .
+
+      # The upstream official CMakeLists currently builds:
+      #   v73
+      #   v75
+      #   v79
+      #   v81
+      #
+      # For this build we intentionally keep the official build system,
+      # toolchain and v81 implementation, but restrict the HTP skel list
+      # to v81 only.
+      - name: Restrict Hexagon HTP skel build to v81
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("ggml/src/ggml-hexagon/CMakeLists.txt")
+          s = p.read_text()
+
+          old = """build_htp_skel(v73)
+          build_htp_skel(v75)
+          build_htp_skel(v79)
+          build_htp_skel(v81)"""
+
+          new = """build_htp_skel(v81)"""
+
+          if old not in s:
+              raise SystemExit(
+                  "Expected upstream Hexagon HTP skel block was not found. "
+                  "Refusing to modify an unexpected CMakeLists.txt."
+              )
+
+          p.write_text(s.replace(old, new))
+
+          print("Hexagon HTP build restricted to v81.")
+          PY
+
+          echo "=== HTP build list ==="
+          grep -n "build_htp_skel" \
+            ggml/src/ggml-hexagon/CMakeLists.txt
+
+      - name: Configure Snapdragon Android build
+        run: |
+          cmake \
+            --preset arm64-android-snapdragon-release \
+            -B build-snapdragon
+
+      - name: Build
+        run: |
+          cmake --build build-snapdragon --parallel
+
+      - name: Install package
+        run: |
+          rm -rf pkg-snapdragon
+
+          cmake \
+            --install build-snapdragon \
+            --prefix pkg-snapdragon/llama.cpp
+
+      # Hard verification:
+      # v73/v75/v79 must NOT exist anywhere in the final package.
+      - name: Verify v81-only HTP package
+        run: |
+          echo "=== HTP libraries in build tree ==="
+          find build-snapdragon \
+            -type f \
+            \( -name 'libggml-htp-v*.so' -o -name 'libggml-htp-v*.dll' \) \
+            -print || true
+
+          echo
+          echo "=== HTP libraries in install package ==="
+          find pkg-snapdragon/llama.cpp/lib \
+            -maxdepth 1 \
+            -type f \
+            -name 'libggml-htp-*.so' \
+            -print \
+            | sort
+
+          echo
+          echo "=== Verify only v81 ==="
+
+          test -f \
+            pkg-snapdragon/llama.cpp/lib/libggml-htp-v81.so
+
+          if find pkg-snapdragon/llama.cpp/lib \
+            -maxdepth 1 \
+            -type f \
+            \( \
+              -name 'libggml-htp-v73.so' \
+              -o -name 'libggml-htp-v75.so' \
+              -o -name 'libggml-htp-v79.so' \
+            \) \
+            | grep -q .; then
+              echo "ERROR: forbidden HTP library found."
+              exit 1
+          fi
+
+          count="$(
+            find pkg-snapdragon/llama.cpp/lib \
+              -maxdepth 1 \
+              -type f \
+              -name 'libggml-htp-*.so' \
+              | wc -l
+          )"
+
+          if [ "$count" -ne 1 ]; then
+              echo "ERROR: expected exactly one HTP library, found $count."
+              exit 1
+          fi
+
+          echo "OK: only libggml-htp-v81.so is installed."
+
+      - name: Verify main Hexagon backend
+        run: |
+          echo "=== Main Hexagon backend dependencies ==="
+          readelf -d \
+            pkg-snapdragon/llama.cpp/lib/libggml-hexagon.so \
+            | grep -E 'NEEDED|SONAME' || true
+
+          echo
+          echo "=== Final libraries ==="
+          ls -lh pkg-snapdragon/llama.cpp/lib/
+
+      - name: Upload Android Snapdragon package
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-cpp-android-snapdragon-opencl-hexagon-v81
+          path: pkg-snapdragon/llama.cpp
+          if-no-files-found: error
+          retention-days: 7
