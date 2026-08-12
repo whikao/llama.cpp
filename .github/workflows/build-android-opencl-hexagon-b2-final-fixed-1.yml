@@ -1,0 +1,206 @@
+name: Build llama.cpp Android CPU OpenCL Hexagon (B2)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # Use the official Snapdragon Android toolchain image.
+      # It contains the Android NDK, OpenCL SDK, Hexagon SDK, CMake, etc.
+      - name: Build CPU + OpenCL + Hexagon
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -u "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            ghcr.io/snapdragon-toolchain/arm64-android:v0.7 \
+            bash -lc '
+              set -e
+              cd /workspace
+
+              echo "=== Toolchain environment ==="
+              echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+              echo "OPENCL_SDK_ROOT=$OPENCL_SDK_ROOT"
+              echo "HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT"
+              echo "HEXAGON_TOOLS_ROOT=$HEXAGON_TOOLS_ROOT"
+
+              echo
+              echo "=== Copy official Snapdragon CMake preset ==="
+              cp docs/backend/snapdragon/CMakeUserPresets.json .
+
+              echo
+              echo "=== Configure ==="
+              cmake --preset arm64-android-snapdragon-release -B build-snapdragon
+
+              echo
+              echo "=== Verify configured backends ==="
+              cmake -LA -N build-snapdragon | grep -E 'GGML_(OPENCL|HEXAGON):' | tee /tmp/backend-config.txt
+              grep -q '^GGML_OPENCL:BOOL=ON$' /tmp/backend-config.txt
+              grep -q '^GGML_HEXAGON:BOOL=ON$' /tmp/backend-config.txt
+
+              echo
+              echo "=== Build ==="
+              cmake --build build-snapdragon --parallel 2
+
+              echo
+              echo "=== Install ==="
+              rm -rf pkg-snapdragon
+              cmake --install build-snapdragon \
+                --prefix pkg-snapdragon/llama.cpp
+
+              echo
+              echo "=== Installed files ==="
+              find pkg-snapdragon/llama.cpp \
+                -maxdepth 2 -type f \
+                \( -name "llama-cli" \
+                -o -name "llama-bench" \
+                -o -name "llama-server" \
+                -o -name "libggml*.so" \) \
+                -print | sort
+
+              echo
+              echo "=== Verify required libraries ==="
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-cpu.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-opencl.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-hexagon.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-htp-v81.so
+              test -f pkg-snapdragon/llama.cpp/bin/llama-cli
+
+              echo
+              echo "=== Verify HTP runtime libraries ==="
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-htp-v73.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-htp-v75.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-htp-v79.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-htp-v81.so
+
+              echo
+              echo "=== Create Termux helpers ==="
+              mkdir -p pkg-snapdragon/llama.cpp/scripts
+
+              cat > pkg-snapdragon/llama.cpp/setup-termux.sh << "EOF"
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -e
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+
+          export LD_LIBRARY_PATH="/vendor/lib64:/vendor/lib:$BASE/lib:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:${ADSP_LIBRARY_PATH:-}"
+
+          echo "llama.cpp Snapdragon CPU + OpenCL + Hexagon"
+          echo
+          echo "Library path:"
+          echo "$LD_LIBRARY_PATH"
+          echo
+          echo "Binaries:"
+          ls -lh "$BASE/bin"
+          echo
+          echo "Libraries:"
+          ls -lh "$BASE/lib"/libggml*.so 2>/dev/null || true
+          EOF
+
+              chmod +x pkg-snapdragon/llama.cpp/setup-termux.sh
+
+              cat > pkg-snapdragon/llama.cpp/check-devices.sh << "EOF"
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -e
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="/vendor/lib64:/vendor/lib:$BASE/lib:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:${ADSP_LIBRARY_PATH:-}"
+
+          exec "$BASE/bin/llama-cli" --list-devices
+          EOF
+
+              chmod +x pkg-snapdragon/llama.cpp/check-devices.sh
+
+              cat > pkg-snapdragon/llama.cpp/run-qwen-opencl.sh << "EOF"
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -e
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="/vendor/lib64:/vendor/lib:$BASE/lib:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:${ADSP_LIBRARY_PATH:-}"
+
+          MODEL="/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+
+          exec "$BASE/bin/llama-cli" \
+            --device GPUOpenCL \
+            -ngl auto \
+            -c 128 \
+            -t 4 \
+            -n 128 \
+            -v \
+            -m "$MODEL" \
+            -p "你好，请详细介绍一下你自己，以及你擅长处理哪些类型的问题。"
+          EOF
+
+              chmod +x pkg-snapdragon/llama.cpp/run-qwen-opencl.sh
+
+              cat > pkg-snapdragon/llama.cpp/run-htp-q4_0.sh << "EOF"
+          #!/data/data/com.termux/files/usr/bin/bash
+          set -e
+
+          BASE="$(cd "$(dirname "$0")" && pwd)"
+          export LD_LIBRARY_PATH="/vendor/lib64:/vendor/lib:$BASE/lib:${LD_LIBRARY_PATH:-}"
+          export ADSP_LIBRARY_PATH="$BASE/lib:${ADSP_LIBRARY_PATH:-}"
+
+          # Valid upstream Hexagon smoke-test quantization.
+          # Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf is kept for OpenCL;
+          # it is NOT used here because Q4_K_M is not supported by Hexagon.
+          MODEL="/sdcard/gguf/Llama-3.2-1B-Instruct-Q4_0.gguf"
+
+          exec "$BASE/bin/llama-cli" \
+            --device HTP0 \
+            -ngl 99 \
+            -c 128 \
+            -t 4 \
+            -n 128 \
+            -v \
+            -m "$MODEL" \
+            -p "你好，请简单介绍一下你自己。"
+          EOF
+
+              chmod +x pkg-snapdragon/llama.cpp/run-htp-q4_0.sh
+
+              echo
+              echo "=== Verify helper scripts ==="
+              test -x pkg-snapdragon/llama.cpp/setup-termux.sh
+              test -x pkg-snapdragon/llama.cpp/check-devices.sh
+              test -x pkg-snapdragon/llama.cpp/run-qwen-opencl.sh
+              test -x pkg-snapdragon/llama.cpp/run-htp-q4_0.sh
+              test ! -e pkg-snapdragon/llama.cpp/run-qwen-hexagon.sh
+
+              echo
+              echo "=== Package ==="
+              PACKAGE="pkg-snapdragon/llama.cpp-android-cpu-opencl-hexagon-b2.tar.gz"
+
+              # IMPORTANT: -C only changes the directory used for the archive
+              # input files; it does not put the archive itself in that directory.
+              # Therefore the output path must be explicit.
+              tar -czf "$PACKAGE" \
+                -C pkg-snapdragon \
+                llama.cpp
+
+              echo
+              echo "=== Verify package ==="
+              test -f "$PACKAGE"
+              ls -lh "$PACKAGE"
+              tar -tzf "$PACKAGE" >/dev/null
+              echo "Package archive is valid."
+            '
+
+      - name: Upload B2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-android-cpu-opencl-hexagon-b2
+          path: pkg-snapdragon/llama.cpp-android-cpu-opencl-hexagon-b2.tar.gz
+          if-no-files-found: error
+          retention-days: 14
