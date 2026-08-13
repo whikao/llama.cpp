@@ -3920,10 +3920,18 @@ static enum ggml_backend_dev_type ggml_backend_hexagon_device_get_type(ggml_back
     GGML_UNUSED(dev);
 }
 
+static enum ggml_backend_dev_memory_type ggml_backend_hexagon_device_get_memory_type(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    // Qualcomm Hexagon/HTP on Snapdragon uses the system memory pool (UMA).
+    // HTP intentionally reports 0/0, so --fit must fall back to host memory.
+    return GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+}
+
 static void ggml_backend_hexagon_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     props->name        = ggml_backend_hexagon_device_get_name(dev);
     props->description = ggml_backend_hexagon_device_get_description(dev);
     props->type        = ggml_backend_hexagon_device_get_type(dev);
+    props->memory_type = ggml_backend_hexagon_device_get_memory_type(dev);
     ggml_backend_hexagon_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = {
         /* .async                 = */ true,
@@ -4269,6 +4277,7 @@ static const struct ggml_backend_device_i ggml_backend_hexagon_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .get_memory_type      = */ ggml_backend_hexagon_device_get_memory_type,
 };
 
 //** backend registry
