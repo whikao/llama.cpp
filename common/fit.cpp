@@ -371,6 +371,14 @@ static void common_params_fit_impl(
     int64_t shared_uma_margin = 0;
     bool has_shared_uma = false;
 
+    // Safety layer for shared UMA (SM8850/Android): Linux MemAvailable is a
+    // system-wide estimate of memory that can still be allocated/reclaimed.
+    // Do not expose all of it to HTP/OpenCL: Android, the driver, mappings and
+    // runtime allocations still need headroom.  Keep the reserve conservative
+    // and, importantly, apply it only when an HTP backend is present.
+    constexpr int64_t SHARED_UMA_SAFETY_RESERVE = 1536LL * MiB;
+    int64_t shared_uma_runtime_free = 0;
+
     for (size_t id = 0; id < nd; id++) {
         if (shared_physical_memory[id]) {
             has_shared_uma = true;
@@ -384,6 +392,21 @@ static void common_params_fit_impl(
     // so that projected host usage must still be included once.
     if (has_shared_uma) {
         shared_uma_free = int64_t(dmds_full.back().free);
+
+        // Prefer the real Android/Linux MemAvailable value over the CPU
+        // backend's very large virtual/system-memory figure.  If the probe is
+        // unavailable, retain the existing backend value rather than guessing.
+        const common_memprobe_t probe = common_memprobe_linux();
+        if (probe.mem_available >= 0) {
+            const int64_t mem_available = probe.mem_available * 1024;
+            shared_uma_runtime_free = std::max<int64_t>(0, mem_available - SHARED_UMA_SAFETY_RESERVE);
+            shared_uma_free = std::min(shared_uma_free, shared_uma_runtime_free);
+            LOG_TRC("%s: shared UMA safety: MemAvailable=%" PRId64 " MiB, reserve=%" PRId64 " MiB, budget=%" PRId64 " MiB\n",
+                    __func__, mem_available/MiB, SHARED_UMA_SAFETY_RESERVE/MiB, shared_uma_free/MiB);
+        } else {
+            shared_uma_runtime_free = shared_uma_free;
+            LOG_WRN("%s: shared UMA safety: MemAvailable unavailable; using backend host-memory value\n", __func__);
+        }
     }
 
     auto total_margin = [&]() -> int64_t {
