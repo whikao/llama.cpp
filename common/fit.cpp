@@ -230,34 +230,40 @@ static void common_params_fit_impl(
         }
     }
 
-    // Devices with UNIFIED memory (e.g. HTP/Hexagon and OpenCL on mobile
-    // integrated GPUs) share the same physical host/DDR memory pool.
-    // Treat that pool as one budget instead of giving every device a copy of
-    // the host memory budget.
+    // Devices marked UNIFIED share the host/DDR physical memory pool. Keep
+    // the native per-device free-memory limit as an additional cap: this is
+    // important for Qualcomm OpenCL, which reports a real device budget
+    // (7501 MiB in the SM8850 logs) even though the memory is physically UMA.
     std::vector<bool> unified_memory;
+    std::vector<bool> shared_physical_memory;
     unified_memory.reserve(nd);
-
-    int64_t shared_uma_free   = 0;
-    int64_t shared_uma_margin = 0;
-    bool has_shared_uma = false;
+    shared_physical_memory.reserve(nd);
 
     for (size_t id = 0; id < nd; id++) {
         const bool is_unified =
             ggml_backend_dev_memory_type(devs[id]) ==
             GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
         unified_memory.push_back(is_unified);
+        shared_physical_memory.push_back(is_unified);
+    }
 
-        if (is_unified) {
+    int64_t shared_uma_free   = 0;
+    int64_t shared_uma_margin = 0;
+    bool has_shared_uma = false;
+
+    for (size_t id = 0; id < nd; id++) {
+        if (shared_physical_memory[id]) {
             has_shared_uma = true;
-            shared_uma_free   = std::max(shared_uma_free, int64_t(dmds_full[id].free));
             shared_uma_margin = std::max(shared_uma_margin, margins[id]);
         }
     }
 
-    // Host memory is the physical backing store for UNIFIED devices.
-    // Use the host free-memory reading as the single shared UMA budget.
+    // The host free-memory reading is the physical shared pool. It excludes
+    // memory already allocated by the process, while the host memory breakdown
+    // below describes additional memory required by the candidate parameters,
+    // so that projected host usage must still be included once.
     if (has_shared_uma) {
-        shared_uma_free = std::max(shared_uma_free, int64_t(dmds_full.back().free));
+        shared_uma_free = int64_t(dmds_full.back().free);
     }
 
     auto total_margin = [&]() -> int64_t {
@@ -267,7 +273,7 @@ static void common_params_fit_impl(
 
         int64_t margin = has_shared_uma ? shared_uma_margin : 0;
         for (size_t id = 0; id < nd; id++) {
-            if (!unified_memory[id]) {
+            if (!shared_physical_memory[id]) {
                 margin += margins[id];
             }
         }
@@ -278,8 +284,7 @@ static void common_params_fit_impl(
     int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
     int64_t sum_projected_model = 0;
-    std::vector<int64_t> projected_free_per_device;
-    projected_free_per_device.reserve(nd);
+    std::vector<int64_t> projected_free_per_device(nd, 0);
 
     if (nd == 0) {
         sum_projected_used = dmds_full.back().mb.total();
@@ -297,53 +302,63 @@ static void common_params_fit_impl(
             LOG_TRC("%s: projected memory use with initial parameters [MiB]:\n", __func__);
         }
 
-        int64_t shared_uma_used = has_shared_uma ? int64_t(dmds_full.back().mb.total()) : 0;
+        int64_t shared_uma_used  = has_shared_uma ? int64_t(dmds_full.back().mb.total()) : 0;
         int64_t shared_uma_model = has_shared_uma ? int64_t(dmds_full.back().mb.model) : 0;
 
+        // Count the shared physical pool once, while keeping each backend's
+        // native memory limit independent. This is important for Adreno: its
+        // driver may report 7501 MiB even though that memory is ultimately
+        // backed by the same DDR pool as HTP.
         for (size_t id = 0; id < nd; id++) {
             const llama_device_memory_data & dmd = dmds_full[id];
             const int64_t projected_used = dmd.mb.total();
 
-            if (unified_memory[id]) {
-                shared_uma_used += projected_used;
+            if (shared_physical_memory[id]) {
+                shared_uma_used  += projected_used;
                 shared_uma_model += dmd.mb.model;
             } else {
                 const int64_t projected_free = dmd.free - projected_used;
-                projected_free_per_device.push_back(projected_free);
+                projected_free_per_device[id] = projected_free;
                 sum_free           += dmd.free;
                 sum_projected_free += projected_free;
-            }
-
-            if (!unified_memory[id]) {
+                sum_projected_used += projected_used;
                 sum_projected_model += dmd.mb.model;
             }
+        }
 
-            if (nd > 1) {
-                const int64_t displayed_free = unified_memory[id]
-                    ? shared_uma_free - shared_uma_used
-                    : dmd.free - projected_used;
+        if (has_shared_uma) {
+            const int64_t shared_projected_free = shared_uma_free - shared_uma_used;
+            sum_free            += shared_uma_free;
+            sum_projected_free  += shared_projected_free;
+            sum_projected_used  += shared_uma_used;
+            sum_projected_model += shared_uma_model;
+
+            for (size_t id = 0; id < nd; id++) {
+                if (!shared_physical_memory[id]) {
+                    continue;
+                }
+                const int64_t native_free = dmds_full[id].free - dmds_full[id].mb.total();
+                const int64_t effective_free = std::min(native_free, shared_projected_free);
+                projected_free_per_device[id] = effective_free;
+            }
+
+            LOG_TRC("%s:   - shared UMA pool: %6" PRId64 " free, %6" PRId64 " used\n",
+                __func__, shared_projected_free/MiB, shared_uma_used/MiB);
+        }
+
+        if (nd > 1) {
+            for (size_t id = 0; id < nd; id++) {
+                const llama_device_memory_data & dmd = dmds_full[id];
+                const int64_t projected_used = dmd.mb.total();
+                const int64_t native_free = dmd.free - projected_used;
+                int64_t displayed_free = native_free;
+                if (shared_physical_memory[id]) {
+                    displayed_free = std::min(native_free, shared_uma_free - shared_uma_used);
+                }
                 LOG_TRC("%s:   - %s: %6" PRId64 " total, %6" PRId64 " used, %6" PRId64 " free vs. target of %6" PRId64 "\n",
                     __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB,
                     displayed_free/MiB, margins[id]/MiB);
             }
-        }
-
-        // Host allocations and all UNIFIED-device allocations consume the
-        // same physical DDR pool, so count that pool exactly once.
-        if (has_shared_uma) {
-            const int64_t shared_projected_free = shared_uma_free - shared_uma_used;
-            sum_free           += shared_uma_free;
-            sum_projected_free += shared_projected_free;
-            sum_projected_used += shared_uma_used;
-            sum_projected_model += shared_uma_model;
-
-            projected_free_per_device.insert(
-                projected_free_per_device.end(),
-                std::count(unified_memory.begin(), unified_memory.end(), true),
-                shared_projected_free);
-
-            LOG_TRC("%s:   - shared UMA pool: %6" PRId64 " free, %6" PRId64 " used\n",
-                __func__, shared_projected_free/MiB, shared_uma_used/MiB);
         }
         assert(sum_free >= 0 && sum_projected_used >= 0);
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
@@ -614,7 +629,7 @@ static void common_params_fit_impl(
         if (has_shared_uma) {
             int64_t shared_used = int64_t(dmds_cpu_moe.back().mb.total());
             for (size_t id = 0; id < nd; id++) {
-                if (unified_memory[id]) {
+                if (shared_physical_memory[id]) {
                     shared_used += int64_t(dmds_cpu_moe[id].mb.total());
                 } else {
                     global_surplus_cpu_moe += int64_t(dmds_cpu_moe[id].free);
@@ -642,25 +657,25 @@ static void common_params_fit_impl(
         mparams->tensor_buft_overrides = tensor_buft_overrides;
     }
 
-    const int64_t host_uma_used = has_shared_uma ? int64_t(dmds_full.back().mb.total()) : 0;
-
-    // For a UNIFIED device, the target is the remaining capacity of the
-    // single shared UMA pool after accounting for all other UNIFIED-device
-    // allocations and fixed host allocations. Dedicated devices retain their
-    // original independent targets.
+    // For a shared-physical-memory device, the target is constrained by both
+    // its native backend-reported free memory and the remaining shared DDR
+    // pool. Host memory required by the candidate parameters is part of that
+    // shared pool and is counted once below.
     auto target_for_device = [&](size_t id, const std::vector<int64_t> & mem) -> int64_t {
-        if (!unified_memory[id]) {
-            return int64_t(dmds_full[id].free) - margins[id];
+        const int64_t native_target = int64_t(dmds_full[id].free) - margins[id];
+        if (!shared_physical_memory[id]) {
+            return native_target;
         }
 
-        int64_t used_other_unified = host_uma_used;
+        int64_t used_other_shared = has_shared_uma ? int64_t(dmds_full.back().mb.total()) : 0;
         for (size_t jd = 0; jd < nd; jd++) {
-            if (jd != id && unified_memory[jd]) {
-                used_other_unified += mem[jd];
+            if (jd != id && shared_physical_memory[jd]) {
+                used_other_shared += mem[jd];
             }
         }
 
-        return shared_uma_free - shared_uma_margin - used_other_unified;
+        const int64_t shared_target = shared_uma_free - shared_uma_margin - used_other_shared;
+        return std::min(native_target, shared_target);
     };
 
     std::vector<int64_t> targets; // initial per-device targets, for diagnostics
