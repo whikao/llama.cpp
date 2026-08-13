@@ -26,6 +26,25 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// Qualcomm Hexagon/HTP uses UMA on Android: device allocations and host allocations
+// consume the same physical system RAM.  The Hexagon backend may therefore report
+// 0/0 from ggml_backend_dev_memory() even though allocations are valid.
+static bool common_fit_is_hexagon_uma(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const char * name = ggml_backend_dev_name(dev);
+    const char * desc = ggml_backend_dev_description(dev);
+
+    const std::string name_s = name ? name : "";
+    const std::string desc_s = desc ? desc : "";
+
+    return name_s.rfind("HTP", 0) == 0 ||
+           name_s.find("Hexagon") != std::string::npos ||
+           desc_s.find("Hexagon") != std::string::npos;
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -86,17 +105,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         if (!dev) {
             continue;
         }
-
-        // CPU backend buffers (including CPU_REPACK) consume the same physical
-        // host/UMA memory pool.  Keep them in the host bucket, without changing
-        // any dedicated-device memory accounting.
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            ret.back().mb.model   += mb.model;
-            ret.back().mb.context += mb.context;
-            ret.back().mb.compute += mb.compute;
-            continue;
-        }
-
         for (size_t i = 0; i < nd; i++) {
             if (dev == llama_model_get_device(model, i)) {
                 ret[i].mb.model   += mb.model;
@@ -125,10 +133,19 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
-        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
-        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
-        // not assign anything to a device with an unknown memory budget.
-        if (free == 0 && total == 0) {
+        // Qualcomm Hexagon/HTP is UMA on Android.  0/0 means there is no separate
+        // device-memory pool to report; use the host RAM budget for --fit.  The fit
+        // calculations below additionally fold host allocations into HTP usage so
+        // this shared budget is counted exactly once.
+        if (free == 0 && total == 0 && common_fit_is_hexagon_uma(dev)) {
+            free  = ret.back().free;
+            total = ret.back().total;
+            LOG_INF("%s: device %s is Hexagon UMA; using host memory budget (%zu MiB free / %zu MiB total)\n",
+                    __func__, ggml_backend_dev_name(dev), free/MiB, total/MiB);
+        } else if (free == 0 && total == 0) {
+            // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
+            // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
+            // not assign anything to a device with an unknown memory budget.
             const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
@@ -206,12 +223,18 @@ static void common_params_fit_impl(
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-    const size_t nd = devs.size(); // number of devices
 
-    // The initial host footprint is the baseline already implied by the current
-    // model/context configuration.  Candidate checks below only charge the
-    // additional host/UMA footprint introduced by the candidate.
-    const int64_t host_baseline_used = static_cast<int64_t>(dmds_full.back().mb.total());
+    // For Hexagon UMA, HTP allocations and host allocations share one physical RAM
+    // budget.  Any fit comparison against HTP free memory must therefore include
+    // both sides.  Other backends keep the upstream behavior unchanged.
+    auto fit_used_for_device = [&](const dmds_t & dmds, size_t id) -> int64_t {
+        int64_t used = dmds[id].mb.total();
+        if (common_fit_is_hexagon_uma(devs[id])) {
+            used += dmds.back().mb.total();
+        }
+        return used;
+    };
+    const size_t nd = devs.size(); // number of devices
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -265,7 +288,7 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             const llama_device_memory_data & dmd = dmds_full[id];
 
-            const int64_t projected_used = dmd.mb.total();
+            const int64_t projected_used = fit_used_for_device(dmds_full, id);
             const int64_t projected_free = dmd.free - projected_used;
             projected_free_per_device.push_back(projected_free);
 
@@ -350,7 +373,7 @@ static void common_params_fit_impl(
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
                         for (size_t id = 0; id < nd; id++) {
-                            sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
+                            sum_projected_used_min_ctx += fit_used_for_device(dmds_min_ctx, id);
                         }
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
@@ -515,33 +538,6 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tensor_buft_overrides;
     };
 
-    // v15: host/UMA candidate state is kept separate from per-device memory.  HTP
-    // may report 0/0, so it must never be represented by a fabricated device
-    // capacity or by unsigned subtraction.
-    bool last_host_candidate_ok = true;
-    bool last_shared_uma_candidate_ok = true;
-    bool selected_host_candidate_ok = false;
-
-    // On the target SM8850 setup, a GPU/IGPU device reporting 0/0 memory
-    // indicates a shared-UMA accelerator (HTP). Treat accelerator and host
-    // footprints as one physical DDR pool without changing backend reports.
-    bool shared_uma_active = false;
-    for (size_t id = 0; id < nd; ++id) {
-        const enum ggml_backend_dev_type type = ggml_backend_dev_type(devs[id]);
-        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU)
-                && dmds_full[id].free == 0 && dmds_full[id].total == 0) {
-            shared_uma_active = true;
-            break;
-        }
-    }
-    const int64_t shared_uma_host_free = static_cast<int64_t>(dmds_full.back().free);
-    const int64_t shared_uma_margin = std::max<int64_t>(MiB, shared_uma_host_free / 20);
-    const int64_t shared_uma_budget = std::max<int64_t>(0, shared_uma_host_free - shared_uma_margin);
-    if (shared_uma_active) {
-        LOG_TRC("%s: shared UMA placement budget enabled: %" PRId64 " MiB (host free=%" PRId64 ", safety margin=%" PRId64 ")\n",
-            __func__, shared_uma_budget/MiB, shared_uma_host_free/MiB, shared_uma_margin/MiB);
-    }
-
     // utility function that returns the memory use per device for given numbers of layers per device
     auto get_memory_for_layers = [&](
             const char * func_name,
@@ -558,53 +554,13 @@ static void common_params_fit_impl(
             const ngl_t & n = ngl_per_device[id];
             LOG_TRC(
                 "%s: id=%zu, n_layer=%2" PRIu32 ", n_part=%2" PRIu32 ", overflow_type=%d, mem=%6" PRId64 " MiB\n",
-                func_name, id, n.n_layer, n.n_part, int(n.overflow_type), dmd_nl[id].mb.total()/MiB);
+                func_name, id, n.n_layer, n.n_part, int(n.overflow_type), fit_used_for_device(dmd_nl, id)/MiB);
         }
 
         std::vector<int64_t> ret;
         ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
-            ret.push_back(dmd_nl[id].mb.total());
-        }
-
-        // CPU_REPACK and ordinary CPU/host buffers share the system DDR pool.
-        // Charge only the candidate's incremental host footprint against the
-        // currently free host memory.  Do not add the baseline twice and do not
-        // manufacture a memory total for HTP's 0/0 report.
-        const int64_t host_candidate_used = static_cast<int64_t>(dmd_nl.back().mb.total());
-        const int64_t host_increment = std::max<int64_t>(0, host_candidate_used - host_baseline_used);
-        const int64_t host_free = static_cast<int64_t>(dmd_nl.back().free);
-        const int64_t host_margin = std::max<int64_t>(MiB, host_free / 20);
-        const int64_t host_budget = std::max<int64_t>(0, host_free - host_margin);
-        last_host_candidate_ok = host_increment <= host_budget;
-
-        if (shared_uma_active) {
-            int64_t shared_used = static_cast<int64_t>(dmd_nl.back().mb.total());
-            for (size_t id = 0; id < nd; ++id) {
-                const enum ggml_backend_dev_type type = ggml_backend_dev_type(devs[id]);
-                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    shared_used += static_cast<int64_t>(dmd_nl[id].mb.total());
-                }
-            }
-            last_shared_uma_candidate_ok = shared_used <= shared_uma_budget;
-            if (!last_shared_uma_candidate_ok) {
-                LOG_TRC(
-                    "%s: shared-UMA candidate rejected: accelerator+host footprint=%" PRId64
-                    " MiB, shared DDR budget=%" PRId64 " MiB (host free=%" PRId64
-                    " MiB, safety margin=%" PRId64 " MiB)\n",
-                    func_name, shared_used/MiB, shared_uma_budget/MiB,
-                    shared_uma_host_free/MiB, shared_uma_margin/MiB);
-            }
-        } else {
-            last_shared_uma_candidate_ok = true;
-        }
-
-        if (!last_host_candidate_ok) {
-            LOG_TRC(
-                "%s: host candidate rejected: incremental CPU/host buffers use %" PRId64
-                " MiB, host free=%" PRId64 " MiB, safety margin=%" PRId64
-                " MiB, baseline=%" PRId64 " MiB\n",
-                func_name, host_increment/MiB, host_free/MiB, host_margin/MiB, host_baseline_used/MiB);
+            ret.push_back(fit_used_for_device(dmd_nl, id));
         }
         return ret;
     };
@@ -623,7 +579,7 @@ static void common_params_fit_impl(
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
-            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+            global_surplus_cpu_moe -= fit_used_for_device(dmds_cpu_moe, id) + margins[id];
         }
 
         if (global_surplus_cpu_moe > 0) {
@@ -681,16 +637,12 @@ static void common_params_fit_impl(
         }
         if (ngl_per_device_high[id].n_layer > 0) {
             std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-            const bool host_ok_high = last_host_candidate_ok && last_shared_uma_candidate_ok;
-            if (!host_ok_high || mem_high[id] > targets[id]) {
+            if (mem_high[id] > targets[id]) {
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    const int64_t mem_delta = mem_high[id] - mem[id];
-                    uint32_t step_size = mem_delta > 0
-                        ? int64_t(delta) * (targets[id] - mem[id]) / mem_delta
-                        : uint32_t(1);
+                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                     step_size = std::max(step_size, uint32_t(1));
                     step_size = std::min(step_size, delta - 1);
 
@@ -702,11 +654,9 @@ static void common_params_fit_impl(
                     }
                     const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                    const bool host_ok_test = last_host_candidate_ok && last_shared_uma_candidate_ok;
-                    if (host_ok_test && mem_test[id] <= targets[id]) {
+                    if (mem_test[id] <= targets[id]) {
                         ngl_per_device = ngl_per_device_test;
                         mem            = mem_test;
-                        selected_host_candidate_ok = true;
                         LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
                     } else {
                         ngl_per_device_high = ngl_per_device_test;
@@ -715,11 +665,10 @@ static void common_params_fit_impl(
                     }
                     delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 }
-            } else if (host_ok_high) {
+            } else {
                 assert(ngl_per_device_high[id].n_layer == n_unassigned);
                 ngl_per_device = ngl_per_device_high;
                 mem            = mem_high;
-                selected_host_candidate_ok = true;
                 LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
             }
         }
@@ -730,10 +679,6 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
-        if (!selected_host_candidate_ok) {
-            throw common_params_fit_exception(
-                "no --fit placement satisfies the host/UMA memory budget after incremental CPU_REPACK accounting");
-        }
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -765,15 +710,11 @@ static void common_params_fit_impl(
         size_t id_dense_start_high = nd - 1;
         std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
 
-        const bool host_ok_high = last_host_candidate_ok && last_shared_uma_candidate_ok;
-        if (!host_ok_high || mem_high[id] > targets[id]) {
+        if (mem_high[id] > targets[id]) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                const int64_t mem_delta = mem_high[id] - mem[id];
-                uint32_t step_size = mem_delta > 0
-                    ? int64_t(delta) * (targets[id] - mem[id]) / mem_delta
-                    : uint32_t(1);
+                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
@@ -793,11 +734,9 @@ static void common_params_fit_impl(
                 }
                 const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                const bool host_ok_test = last_host_candidate_ok && last_shared_uma_candidate_ok;
-                if (host_ok_test && mem_test[id] <= targets[id]) {
+                if (mem_test[id] <= targets[id]) {
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
-                    selected_host_candidate_ok = true;
                     id_dense_start = id_dense_start_test;
                     LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
@@ -811,10 +750,9 @@ static void common_params_fit_impl(
                 assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
                 delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             }
-        } else if (host_ok_high) {
+        } else {
             ngl_per_device = ngl_per_device_high;
             mem            = mem_high;
-            selected_host_candidate_ok = true;
             id_dense_start = id_dense_start_high;
             LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
                 __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
@@ -838,12 +776,10 @@ static void common_params_fit_impl(
             }
             LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
             std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-            const bool host_ok_test_up = last_host_candidate_ok && last_shared_uma_candidate_ok;
-            if (host_ok_test_up && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+            if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
                 mem            = mem_test;
-                selected_host_candidate_ok = true;
                 id_dense_start = id_dense_start_test;
                 LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), id_dense_start=%zu\n",
                     __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
@@ -851,12 +787,10 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                const bool host_ok_test = last_host_candidate_ok && last_shared_uma_candidate_ok;
-                if (host_ok_test && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
-                    selected_host_candidate_ok = true;
                     id_dense_start = id_dense_start_test;
                     LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
@@ -865,12 +799,10 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                const bool host_ok_test_attn = last_host_candidate_ok && last_shared_uma_candidate_ok;
-                if (host_ok_test_attn && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
-                    selected_host_candidate_ok = true;
                     id_dense_start = id_dense_start_test;
                     LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
@@ -890,11 +822,6 @@ static void common_params_fit_impl(
         LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
-    }
-
-    if (!selected_host_candidate_ok) {
-        throw common_params_fit_exception(
-            "no --fit placement satisfies the host/UMA memory budget after incremental CPU_REPACK accounting");
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
