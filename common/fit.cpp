@@ -323,15 +323,48 @@ static void common_params_fit_impl(
     // (7501 MiB in the SM8850 logs) even though the memory is physically UMA.
     std::vector<bool> unified_memory;
     std::vector<bool> shared_physical_memory;
+    std::vector<bool> htp_zero_memory;
     unified_memory.reserve(nd);
     shared_physical_memory.reserve(nd);
+    htp_zero_memory.reserve(nd);
+
+    // Qualcomm's Adreno OpenCL backend may report UNIFIED memory even when
+    // running by itself. Do not change the official single-backend fit in
+    // that case: the shared-DDR constraint is only enabled when an HTP/
+    // Hexagon backend is actually present. Once HTP is present, both HTP and
+    // OpenCL allocations are treated as consumers of the same physical DDR
+    // pool, while each backend keeps its own native device-memory cap.
+    bool has_htp_backend = false;
+    for (size_t id = 0; id < nd; id++) {
+        const std::string name = ggml_backend_dev_name(devs[id]);
+        const std::string desc = ggml_backend_dev_description(devs[id]);
+        if (name.find("HTP") != std::string::npos ||
+            desc.find("Hexagon") != std::string::npos ||
+            desc.find("HTP") != std::string::npos) {
+            has_htp_backend = true;
+            break;
+        }
+    }
 
     for (size_t id = 0; id < nd; id++) {
         const bool is_unified =
             ggml_backend_dev_memory_type(devs[id]) ==
             GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+        const std::string name = ggml_backend_dev_name(devs[id]);
+        const std::string desc = ggml_backend_dev_description(devs[id]);
+        const bool is_htp = name.find("HTP") != std::string::npos ||
+                            desc.find("Hexagon") != std::string::npos ||
+                            desc.find("HTP") != std::string::npos;
+        const bool zero_memory_reported = is_htp &&
+            dmds_full[id].free == 0 && dmds_full[id].total == 0;
+
         unified_memory.push_back(is_unified);
-        shared_physical_memory.push_back(is_unified);
+        htp_zero_memory.push_back(zero_memory_reported);
+        // Only activate the shared physical-memory accounting when HTP is
+        // present. This keeps OpenCL-only behavior identical to upstream.
+        // Once HTP is present, all unified devices (including OpenCL) consume
+        // the same physical DDR pool, while OpenCL still keeps its native cap.
+        shared_physical_memory.push_back(has_htp_backend && is_unified);
     }
 
     int64_t shared_uma_free   = 0;
@@ -749,7 +782,12 @@ static void common_params_fit_impl(
     // pool. Host memory required by the candidate parameters is part of that
     // shared pool and is counted once below.
     auto target_for_device = [&](size_t id, const std::vector<int64_t> & mem) -> int64_t {
-        const int64_t native_target = int64_t(dmds_full[id].free) - margins[id];
+        // HTP reports 0/0 because it has no independent device-memory pool.
+        // In the shared-UMA mode its budget comes from the physical DDR pool,
+        // so a zero native report must not turn the HTP target negative.
+        const int64_t native_target = htp_zero_memory[id]
+            ? INT64_MAX
+            : int64_t(dmds_full[id].free) - margins[id];
         if (!shared_physical_memory[id]) {
             return native_target;
         }
