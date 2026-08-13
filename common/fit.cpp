@@ -26,25 +26,6 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// Qualcomm Hexagon/HTP uses UMA on Android: device allocations and host allocations
-// consume the same physical system RAM.  The Hexagon backend may therefore report
-// 0/0 from ggml_backend_dev_memory() even though allocations are valid.
-static bool common_fit_is_hexagon_uma(ggml_backend_dev_t dev) {
-    if (dev == nullptr) {
-        return false;
-    }
-
-    const char * name = ggml_backend_dev_name(dev);
-    const char * desc = ggml_backend_dev_description(dev);
-
-    const std::string name_s = name ? name : "";
-    const std::string desc_s = desc ? desc : "";
-
-    return name_s.rfind("HTP", 0) == 0 ||
-           name_s.find("Hexagon") != std::string::npos ||
-           desc_s.find("Hexagon") != std::string::npos;
-}
-
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -126,6 +107,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().free  = free;
         ret.back().total = total;
     }
+    // A single unified-memory accelerator (notably Hexagon/HTP) shares the
+    // same physical RAM budget as the host. For --fit, account both the
+    // accelerator-side buffers and all host-side buffers against that one
+    // shared budget. This is important for CPU_REPACK: those allocations are
+    // host allocations even when most model layers are assigned to HTP.
+    const bool single_uma_device = nd == 1 &&
+        ggml_backend_dev_memory_type(llama_model_get_device(model, 0)) ==
+            GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
@@ -133,28 +123,38 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
-        // Qualcomm Hexagon/HTP is UMA on Android.  0/0 means there is no separate
-        // device-memory pool to report; use the host RAM budget for --fit.  The fit
-        // calculations below additionally fold host allocations into HTP usage so
-        // this shared budget is counted exactly once.
-        if (free == 0 && total == 0 && common_fit_is_hexagon_uma(dev)) {
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        const enum ggml_backend_dev_memory_type memory_type = ggml_backend_dev_memory_type(dev);
+
+        if (single_uma_device && i == 0) {
+            // HTP may correctly report 0/0 because it has no dedicated VRAM.
+            // Use the host RAM as the one physical budget, and fold every host
+            // allocation into the HTP accounting so --fit cannot count the
+            // same RAM twice or ignore CPU/CPU_REPACK usage.
             free  = ret.back().free;
             total = ret.back().total;
-            LOG_INF("%s: device %s is Hexagon UMA; using host memory budget (%zu MiB free / %zu MiB total)\n",
-                    __func__, ggml_backend_dev_name(dev), free/MiB, total/MiB);
+
+            ret[i].mb.model   += ret.back().mb.model;
+            ret[i].mb.context += ret.back().mb.context;
+            ret[i].mb.compute += ret.back().mb.compute;
+
+            LOG_TRC("%s: device %s uses unified host memory; --fit shared budget = %zu MiB free / %zu MiB total, shared use = %zu MiB\n",
+                    __func__, ggml_backend_dev_name(dev),
+                    free / (1024 * 1024), total / (1024 * 1024),
+                    ret[i].mb.total() / (1024 * 1024));
         } else if (free == 0 && total == 0) {
-            // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
-            // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
-            // not assign anything to a device with an unknown memory budget.
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
+            // Preserve the existing behavior for non-UMA devices. A dedicated
+            // GPU that cannot report a memory budget is not usable by --fit.
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                memory_type == GGML_BACKEND_DEVICE_MEMORY_TYPE_DEDICATED) {
+                LOG_WRN("%s: device %s (GPU, dedicated memory) reported 0 bytes of free and total memory; --fit will not use it\n",
                         __func__, ggml_backend_dev_name(dev));
             } else {
                 free  = ret.back().free;
                 total = ret.back().total;
             }
         }
+
         ret[i].free  = free;
         ret[i].total = total;
     }
@@ -223,17 +223,6 @@ static void common_params_fit_impl(
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-
-    // For Hexagon UMA, HTP allocations and host allocations share one physical RAM
-    // budget.  Any fit comparison against HTP free memory must therefore include
-    // both sides.  Other backends keep the upstream behavior unchanged.
-    auto fit_used_for_device = [&](const dmds_t & dmds, size_t id) -> int64_t {
-        int64_t used = dmds[id].mb.total();
-        if (common_fit_is_hexagon_uma(devs[id])) {
-            used += dmds.back().mb.total();
-        }
-        return used;
-    };
     const size_t nd = devs.size(); // number of devices
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
@@ -288,7 +277,7 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             const llama_device_memory_data & dmd = dmds_full[id];
 
-            const int64_t projected_used = fit_used_for_device(dmds_full, id);
+            const int64_t projected_used = dmd.mb.total();
             const int64_t projected_free = dmd.free - projected_used;
             projected_free_per_device.push_back(projected_free);
 
@@ -373,7 +362,7 @@ static void common_params_fit_impl(
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
                         for (size_t id = 0; id < nd; id++) {
-                            sum_projected_used_min_ctx += fit_used_for_device(dmds_min_ctx, id);
+                            sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
                         }
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
@@ -554,13 +543,13 @@ static void common_params_fit_impl(
             const ngl_t & n = ngl_per_device[id];
             LOG_TRC(
                 "%s: id=%zu, n_layer=%2" PRIu32 ", n_part=%2" PRIu32 ", overflow_type=%d, mem=%6" PRId64 " MiB\n",
-                func_name, id, n.n_layer, n.n_part, int(n.overflow_type), fit_used_for_device(dmd_nl, id)/MiB);
+                func_name, id, n.n_layer, n.n_part, int(n.overflow_type), dmd_nl[id].mb.total()/MiB);
         }
 
         std::vector<int64_t> ret;
         ret.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
-            ret.push_back(fit_used_for_device(dmd_nl, id));
+            ret.push_back(dmd_nl[id].mb.total());
         }
         return ret;
     };
@@ -579,7 +568,7 @@ static void common_params_fit_impl(
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
-            global_surplus_cpu_moe -= fit_used_for_device(dmds_cpu_moe, id) + margins[id];
+            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
         }
 
         if (global_surplus_cpu_moe > 0) {
