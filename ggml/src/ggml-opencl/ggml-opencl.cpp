@@ -10803,10 +10803,19 @@ static enum ggml_backend_dev_type ggml_backend_opencl_device_get_type(ggml_backe
     GGML_UNUSED(dev);
 }
 
+static enum ggml_backend_dev_memory_type ggml_backend_opencl_device_get_memory_type(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    // Adreno on Snapdragon shares the system memory pool with the CPU/HTP.
+    // Keep the existing OpenCL memory reporting as a best-effort capacity hint,
+    // but explicitly describe the underlying memory architecture as UMA.
+    return GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+}
+
 static void ggml_backend_opencl_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     props->name        = ggml_backend_opencl_device_get_name(dev);
     props->description = ggml_backend_opencl_device_get_description(dev);
     props->type        = ggml_backend_opencl_device_get_type(dev);
+    props->memory_type = ggml_backend_opencl_device_get_memory_type(dev);
     ggml_backend_opencl_device_get_memory(dev, &props->memory_free, &props->memory_total);
     props->caps = ggml_backend_dev_caps {
         /* .async                 = */ false,
@@ -10892,6 +10901,7 @@ struct ggml_backend_device_i ggml_backend_opencl_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .get_memory_type      = */ ggml_backend_opencl_device_get_memory_type,
 };
 }
 
