@@ -288,7 +288,7 @@ static void common_params_fit_impl(
     // Diagnostic snapshot: do not feed this directly into the fit budget yet.
     // We first need real SM8850 measurements from OpenCL-only, HTP-only and
     // HTP+OpenCL runs to determine an evidence-based safety reserve.
-    common_memprobe_log("%s: initial", __func__);
+    common_memprobe_log("initial");
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
