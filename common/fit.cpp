@@ -4,10 +4,12 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <fstream>
 #include <set>
 #include <string>
 #include <vector>
@@ -107,34 +109,136 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().free  = free;
         ret.back().total = total;
     }
+    // HTP/Hexagon on Snapdragon reports 0/0 because its buffers are backed by
+    // the same system DDR used by the CPU/OpenCL side.  The fit algorithm has
+    // one free-memory budget per device, so simply copying the host budget to
+    // HTP double-counts the same physical RAM.  When HTP is present, treat all
+    // unified GPU devices as consumers of one shared physical-memory pool.
+    bool has_htp_uma = false;
+    for (size_t i = 0; i < nd; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        const enum ggml_backend_dev_memory_type memory_type =
+            ggml_backend_dev_memory_type(dev);
+        const std::string name = ggml_backend_dev_name(dev);
+        const std::string desc = ggml_backend_dev_description(dev);
+        if (memory_type == GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED &&
+            (name.find("HTP") != std::string::npos ||
+             name.find("Hexagon") != std::string::npos ||
+             desc.find("HTP") != std::string::npos ||
+             desc.find("Hexagon") != std::string::npos)) {
+            has_htp_uma = true;
+            break;
+        }
+        GGML_UNUSED(type);
+    }
+
+    std::vector<size_t> native_free(nd, 0);
+    std::vector<size_t> native_total(nd, 0);
+    std::vector<bool> shared_uma_device(nd, false);
+
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
-        size_t free;
-        size_t total;
+        size_t free = 0;
+        size_t total = 0;
         ggml_backend_dev_memory(dev, &free, &total);
 
-        // UMA devices such as Hexagon/HTP may report 0/0 because their memory
-        // is shared with the host. Only a dedicated GPU-like device with no
-        // memory report is excluded from --fit; UMA/host-memory devices fall
-        // back to the host free/total memory budget.
-        if (free == 0 && total == 0) {
-            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            const enum ggml_backend_dev_memory_type memory_type =
-                ggml_backend_dev_memory_type(dev);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        const enum ggml_backend_dev_memory_type memory_type =
+            ggml_backend_dev_memory_type(dev);
+        shared_uma_device[i] = has_htp_uma &&
+            memory_type == GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED &&
+            (type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+             type == GGML_BACKEND_DEVICE_TYPE_IGPU);
 
+        if (free == 0 && total == 0) {
             if ((type == GGML_BACKEND_DEVICE_TYPE_GPU ||
                  type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
                 memory_type == GGML_BACKEND_DEVICE_MEMORY_TYPE_DEDICATED) {
                 LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
                         __func__, ggml_backend_dev_name(dev));
-            } else {
+            } else if (!shared_uma_device[i]) {
                 free  = ret.back().free;
                 total = ret.back().total;
             }
         }
+
+        native_free[i] = free;
+        native_total[i] = total;
         ret[i].free  = free;
         ret[i].total = total;
+    }
+
+    if (has_htp_uma) {
+        // MemAvailable is the kernel's estimate of memory that can be allocated
+        // without swapping/reclaim pressure.  It is preferable here to the CPU
+        // backend's total/free figure on Android, which can describe the whole
+        // system RAM rather than the currently available physical budget.
+        int64_t shared_budget = -1;
+#if defined(__linux__)
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key;
+        int64_t value_kib = 0;
+        std::string unit;
+        while (meminfo >> key >> value_kib >> unit) {
+            if (key == "MemAvailable:") {
+                shared_budget = value_kib * 1024;
+                break;
+            }
+        }
+#endif
+
+        if (shared_budget > 0) {
+            // The host-side memory breakdown is not added here: CPU_Mapped is
+            // file-backed mmap and must not be treated as an equal-sized second
+            // physical allocation.  CPU_REPACK/context/compute remain governed
+            // by their existing llama.cpp accounting.  Only unified backend
+            // allocations participate in this shared device pool.
+            int64_t shared_used = 0;
+            for (size_t i = 0; i < nd; i++) {
+                if (shared_uma_device[i]) {
+                    shared_used += static_cast<int64_t>(ret[i].mb.total());
+                }
+            }
+
+            for (size_t i = 0; i < nd; i++) {
+                if (!shared_uma_device[i]) {
+                    continue;
+                }
+
+                const int64_t other_used = shared_used -
+                    static_cast<int64_t>(ret[i].mb.total());
+                const int64_t shared_free_for_device =
+                    std::max<int64_t>(0, shared_budget - other_used);
+
+                // Keep a real native limit when one exists (OpenCL), while HTP
+                // gets the remaining portion of the shared UMA pool instead of
+                // inheriting the CPU's entire 15 GiB system-memory figure.
+                const int64_t capped_free =
+                    native_free[i] == 0 ? shared_free_for_device :
+                    std::min<int64_t>(native_free[i], shared_free_for_device);
+
+                ret[i].free = static_cast<size_t>(capped_free);
+                ret[i].total = std::max<size_t>(native_total[i], ret[i].free);
+            }
+
+            LOG_TRC("%s: HTP shared UMA pool: MemAvailable=%" PRId64
+                    " MiB, unified-used=%" PRId64 " MiB\n",
+                    __func__, shared_budget / (1024 * 1024),
+                    shared_used / (1024 * 1024));
+        } else {
+            // If /proc/meminfo is unavailable, retain the backend-native values
+            // rather than inventing a capacity. HTP remains 0/0 in this case.
+            for (size_t i = 0; i < nd; i++) {
+                if (shared_uma_device[i] && native_free[i] == 0 && native_total[i] == 0) {
+                    ret[i].free = 0;
+                    ret[i].total = 0;
+                }
+            }
+            LOG_WRN("%s: HTP shared UMA pool: MemAvailable unavailable; HTP memory remains unknown\n",
+                    __func__);
+        }
     }
 
     devs.clear();
@@ -230,12 +334,61 @@ static void common_params_fit_impl(
         }
     }
 
+    // Devices marked UNIFIED share the host/DDR physical memory pool. Keep
+    // the native per-device free-memory limit as an additional cap: this is
+    // important for Qualcomm OpenCL, which reports a real device budget
+    // (7501 MiB in the SM8850 logs) even though the memory is physically UMA.
+    std::vector<bool> unified_memory;
+    std::vector<bool> shared_physical_memory;
+    unified_memory.reserve(nd);
+    shared_physical_memory.reserve(nd);
+
+    for (size_t id = 0; id < nd; id++) {
+        const bool is_unified =
+            ggml_backend_dev_memory_type(devs[id]) ==
+            GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+        unified_memory.push_back(is_unified);
+        shared_physical_memory.push_back(is_unified);
+    }
+
+    int64_t shared_uma_free   = 0;
+    int64_t shared_uma_margin = 0;
+    bool has_shared_uma = false;
+
+    for (size_t id = 0; id < nd; id++) {
+        if (shared_physical_memory[id]) {
+            has_shared_uma = true;
+            shared_uma_margin = std::max(shared_uma_margin, margins[id]);
+        }
+    }
+
+    // The host free-memory reading is the physical shared pool. It excludes
+    // memory already allocated by the process, while the host memory breakdown
+    // below describes additional memory required by the candidate parameters,
+    // so that projected host usage must still be included once.
+    if (has_shared_uma) {
+        shared_uma_free = int64_t(dmds_full.back().free);
+    }
+
+    auto total_margin = [&]() -> int64_t {
+        if (nd == 0) {
+            return margins[0];
+        }
+
+        int64_t margin = has_shared_uma ? shared_uma_margin : 0;
+        for (size_t id = 0; id < nd; id++) {
+            if (!shared_physical_memory[id]) {
+                margin += margins[id];
+            }
+        }
+        return margin;
+    };
+
     int64_t sum_free            = 0;
     int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
     int64_t sum_projected_model = 0;
-    std::vector<int64_t> projected_free_per_device;
-    projected_free_per_device.reserve(nd);
+    std::vector<int64_t> projected_free_per_device(nd, 0);
 
     if (nd == 0) {
         sum_projected_used = dmds_full.back().mb.total();
@@ -252,21 +405,63 @@ static void common_params_fit_impl(
         if (nd > 1) {
             LOG_TRC("%s: projected memory use with initial parameters [MiB]:\n", __func__);
         }
+
+        int64_t shared_uma_used  = has_shared_uma ? int64_t(dmds_full.back().mb.total()) : 0;
+        int64_t shared_uma_model = has_shared_uma ? int64_t(dmds_full.back().mb.model) : 0;
+
+        // Count the shared physical pool once, while keeping each backend's
+        // native memory limit independent. This is important for Adreno: its
+        // driver may report 7501 MiB even though that memory is ultimately
+        // backed by the same DDR pool as HTP.
         for (size_t id = 0; id < nd; id++) {
             const llama_device_memory_data & dmd = dmds_full[id];
-
             const int64_t projected_used = dmd.mb.total();
-            const int64_t projected_free = dmd.free - projected_used;
-            projected_free_per_device.push_back(projected_free);
 
-            sum_free            += dmd.free;
-            sum_projected_used  += projected_used;
-            sum_projected_free  += projected_free;
-            sum_projected_model += dmd.mb.model;
+            if (shared_physical_memory[id]) {
+                shared_uma_used  += projected_used;
+                shared_uma_model += dmd.mb.model;
+            } else {
+                const int64_t projected_free = dmd.free - projected_used;
+                projected_free_per_device[id] = projected_free;
+                sum_free           += dmd.free;
+                sum_projected_free += projected_free;
+                sum_projected_used += projected_used;
+                sum_projected_model += dmd.mb.model;
+            }
+        }
 
-            if (nd > 1) {
+        if (has_shared_uma) {
+            const int64_t shared_projected_free = shared_uma_free - shared_uma_used;
+            sum_free            += shared_uma_free;
+            sum_projected_free  += shared_projected_free;
+            sum_projected_used  += shared_uma_used;
+            sum_projected_model += shared_uma_model;
+
+            for (size_t id = 0; id < nd; id++) {
+                if (!shared_physical_memory[id]) {
+                    continue;
+                }
+                const int64_t native_free = dmds_full[id].free - dmds_full[id].mb.total();
+                const int64_t effective_free = std::min(native_free, shared_projected_free);
+                projected_free_per_device[id] = effective_free;
+            }
+
+            LOG_TRC("%s:   - shared UMA pool: %6" PRId64 " free, %6" PRId64 " used\n",
+                __func__, shared_projected_free/MiB, shared_uma_used/MiB);
+        }
+
+        if (nd > 1) {
+            for (size_t id = 0; id < nd; id++) {
+                const llama_device_memory_data & dmd = dmds_full[id];
+                const int64_t projected_used = dmd.mb.total();
+                const int64_t native_free = dmd.free - projected_used;
+                int64_t displayed_free = native_free;
+                if (shared_physical_memory[id]) {
+                    displayed_free = std::min(native_free, shared_uma_free - shared_uma_used);
+                }
                 LOG_TRC("%s:   - %s: %6" PRId64 " total, %6" PRId64 " used, %6" PRId64 " free vs. target of %6" PRId64 "\n",
-                    __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB, projected_free/MiB, margins[id]/MiB);
+                    __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB,
+                    displayed_free/MiB, margins[id]/MiB);
             }
         }
         assert(sum_free >= 0 && sum_projected_used >= 0);
@@ -297,13 +492,7 @@ static void common_params_fit_impl(
 
     {
         int64_t global_surplus = sum_projected_free;
-        if (nd == 0) {
-            global_surplus -= margins[0];
-        } else {
-            for (size_t id = 0; id < nd; id++) {
-                global_surplus -= margins[id];
-            }
-        }
+        global_surplus -= total_margin();
         if (global_surplus < 0) {
             if (nd <= 1) {
                 LOG_TRC("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
@@ -316,13 +505,7 @@ static void common_params_fit_impl(
             if (cparams->n_ctx == 0) {
                 if (hp_nct > n_ctx_min) {
                     int64_t sum_used_target = sum_free;
-                    if (nd == 0) {
-                        sum_used_target -= margins[0];
-                    } else {
-                        for (size_t id = 0; id < nd; id++) {
-                            sum_used_target -= margins[id];
-                        }
-                    }
+                    sum_used_target -= total_margin();
                     if (nd > 1) {
                         // for multiple devices we need to be more conservative in terms of how much context we think can fit:
                         //   - for dense models only whole layers can be assigned to devices
@@ -341,6 +524,9 @@ static void common_params_fit_impl(
                     } else {
                         for (size_t id = 0; id < nd; id++) {
                             sum_projected_used_min_ctx += dmds_min_ctx[id].mb.total();
+                        }
+                        if (has_shared_uma) {
+                            sum_projected_used_min_ctx += dmds_min_ctx.back().mb.total();
                         }
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
@@ -544,9 +730,22 @@ static void common_params_fit_impl(
         const dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
 
-        for (size_t id = 0; id < nd; id++) {
-            global_surplus_cpu_moe += dmds_cpu_moe[id].free;
-            global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+        if (has_shared_uma) {
+            int64_t shared_used = int64_t(dmds_cpu_moe.back().mb.total());
+            for (size_t id = 0; id < nd; id++) {
+                if (shared_physical_memory[id]) {
+                    shared_used += int64_t(dmds_cpu_moe[id].mb.total());
+                } else {
+                    global_surplus_cpu_moe += int64_t(dmds_cpu_moe[id].free);
+                    global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+                }
+            }
+            global_surplus_cpu_moe += int64_t(dmds_cpu_moe.back().free) - shared_used - shared_uma_margin;
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                global_surplus_cpu_moe += dmds_cpu_moe[id].free;
+                global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
+            }
         }
 
         if (global_surplus_cpu_moe > 0) {
@@ -562,11 +761,36 @@ static void common_params_fit_impl(
         mparams->tensor_buft_overrides = tensor_buft_overrides;
     }
 
-    std::vector<int64_t> targets; // maximum acceptable memory use per device
+    // For a shared-physical-memory device, the target is constrained by both
+    // its native backend-reported free memory and the remaining shared DDR
+    // pool. Host memory required by the candidate parameters is part of that
+    // shared pool and is counted once below.
+    auto target_for_device = [&](size_t id, const std::vector<int64_t> & mem) -> int64_t {
+        const int64_t native_target = int64_t(dmds_full[id].free) - margins[id];
+        if (!shared_physical_memory[id]) {
+            return native_target;
+        }
+
+        int64_t used_other_shared = has_shared_uma ? int64_t(dmds_full.back().mb.total()) : 0;
+        for (size_t jd = 0; jd < nd; jd++) {
+            if (jd != id && shared_physical_memory[jd]) {
+                used_other_shared += mem[jd];
+            }
+        }
+
+        const int64_t shared_target = shared_uma_free - shared_uma_margin - used_other_shared;
+        return std::min(native_target, shared_target);
+    };
+
+    std::vector<int64_t> targets; // initial per-device targets, for diagnostics
     targets.reserve(nd);
+    // Initial targets are only used for diagnostics. Allocation decisions below
+    // use target_for_device(), which dynamically accounts for the shared UMA pool.
+    std::vector<int64_t> mem_empty(nd, 0);
     for (size_t id = 0; id < nd; id++) {
-        targets.push_back(dmds_full[id].free - margins[id]);
-        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+        targets.push_back(target_for_device(id, mem_empty));
+        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB%s\n", __func__, id, targets[id]/MiB,
+            unified_memory[id] ? " (shared UMA)" : "");
     }
 
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
@@ -604,12 +828,13 @@ static void common_params_fit_impl(
         }
         if (ngl_per_device_high[id].n_layer > 0) {
             std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-            if (mem_high[id] > targets[id]) {
+            const int64_t target = target_for_device(id, mem);
+            if (mem_high[id] > target) {
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
-                    uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                    uint32_t step_size = int64_t(delta) * (target - mem[id]) / (mem_high[id] - mem[id]);
                     step_size = std::max(step_size, uint32_t(1));
                     step_size = std::min(step_size, delta - 1);
 
@@ -621,7 +846,7 @@ static void common_params_fit_impl(
                     }
                     const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                    if (mem_test[id] <= targets[id]) {
+                    if (mem_test[id] <= target_for_device(id, mem_test)) {
                         ngl_per_device = ngl_per_device_test;
                         mem            = mem_test;
                         LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
@@ -640,7 +865,7 @@ static void common_params_fit_impl(
             }
         }
 
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
+        const int64_t projected_margin = target_for_device(id, mem) - mem[id];
         LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
@@ -677,11 +902,12 @@ static void common_params_fit_impl(
         size_t id_dense_start_high = nd - 1;
         std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
 
-        if (mem_high[id] > targets[id]) {
+        const int64_t target = target_for_device(id, mem);
+        if (mem_high[id] > target) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                uint32_t step_size = int64_t(delta) * (target - mem[id]) / (mem_high[id] - mem[id]);
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
@@ -701,7 +927,7 @@ static void common_params_fit_impl(
                 }
                 const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                if (mem_test[id] <= targets[id]) {
+                if (mem_test[id] <= target_for_device(id, mem_test)) {
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
                     id_dense_start = id_dense_start_test;
@@ -743,7 +969,8 @@ static void common_params_fit_impl(
             }
             LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
             std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-            if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+            if (mem_test[id] < target_for_device(id, mem_test) &&
+                    (id + 1 == nd || mem_test[id + 1] < target_for_device(id + 1, mem_test))) {
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
                 mem            = mem_test;
@@ -754,7 +981,8 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                if (mem_test[id] < target_for_device(id, mem_test) &&
+                    (id + 1 == nd || mem_test[id + 1] < target_for_device(id + 1, mem_test))) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
@@ -766,7 +994,8 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                if (mem_test[id] < target_for_device(id, mem_test) &&
+                    (id + 1 == nd || mem_test[id + 1] < target_for_device(id + 1, mem_test))) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
@@ -777,7 +1006,7 @@ static void common_params_fit_impl(
             }
         }
 
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
+        const int64_t projected_margin = target_for_device(id, mem) - mem[id];
         LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
@@ -785,7 +1014,7 @@ static void common_params_fit_impl(
 
     // print info for devices that were not changed during the conversion from dense only to full layers:
     for (size_t id = id_dense_start + 1; id < nd; id++) {
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
+        const int64_t projected_margin = target_for_device(id, mem) - mem[id];
         LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
