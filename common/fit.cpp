@@ -519,7 +519,28 @@ static void common_params_fit_impl(
     // may report 0/0, so it must never be represented by a fabricated device
     // capacity or by unsigned subtraction.
     bool last_host_candidate_ok = true;
+    bool last_shared_uma_candidate_ok = true;
     bool selected_host_candidate_ok = false;
+
+    // On the target SM8850 setup, a GPU/IGPU device reporting 0/0 memory
+    // indicates a shared-UMA accelerator (HTP). Treat accelerator and host
+    // footprints as one physical DDR pool without changing backend reports.
+    bool shared_uma_active = false;
+    for (size_t id = 0; id < nd; ++id) {
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(devs[id]);
+        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU)
+                && dmds_full[id].free == 0 && dmds_full[id].total == 0) {
+            shared_uma_active = true;
+            break;
+        }
+    }
+    const int64_t shared_uma_host_free = static_cast<int64_t>(dmds_full.back().free);
+    const int64_t shared_uma_margin = std::max<int64_t>(MiB, shared_uma_host_free / 20);
+    const int64_t shared_uma_budget = std::max<int64_t>(0, shared_uma_host_free - shared_uma_margin);
+    if (shared_uma_active) {
+        LOG_TRC("%s: shared UMA placement budget enabled: %" PRId64 " MiB (host free=%" PRId64 ", safety margin=%" PRId64 ")\n",
+            __func__, shared_uma_budget/MiB, shared_uma_host_free/MiB, shared_uma_margin/MiB);
+    }
 
     // utility function that returns the memory use per device for given numbers of layers per device
     auto get_memory_for_layers = [&](
@@ -556,10 +577,33 @@ static void common_params_fit_impl(
         const int64_t host_margin = std::max<int64_t>(MiB, host_free / 20);
         const int64_t host_budget = std::max<int64_t>(0, host_free - host_margin);
         last_host_candidate_ok = host_increment <= host_budget;
+
+        if (shared_uma_active) {
+            int64_t shared_used = static_cast<int64_t>(dmd_nl.back().mb.total());
+            for (size_t id = 0; id < nd; ++id) {
+                const enum ggml_backend_dev_type type = ggml_backend_dev_type(devs[id]);
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    shared_used += static_cast<int64_t>(dmd_nl[id].mb.total());
+                }
+            }
+            last_shared_uma_candidate_ok = shared_used <= shared_uma_budget;
+            if (!last_shared_uma_candidate_ok) {
+                LOG_TRC(
+                    "%s: shared-UMA candidate rejected: accelerator+host footprint=%" PRId64
+                    " MiB, shared DDR budget=%" PRId64 " MiB (host free=%" PRId64
+                    " MiB, safety margin=%" PRId64 " MiB)\n",
+                    func_name, shared_used/MiB, shared_uma_budget/MiB,
+                    shared_uma_host_free/MiB, shared_uma_margin/MiB);
+            }
+        } else {
+            last_shared_uma_candidate_ok = true;
+        }
+
         if (!last_host_candidate_ok) {
             LOG_TRC(
-                "%s: host/UMA candidate rejected: incremental CPU/host buffers use %" PRId64
-                " MiB, host free=%" PRId64 " MiB, safety margin=%" PRId64 " MiB, baseline=%" PRId64 " MiB\n",
+                "%s: host candidate rejected: incremental CPU/host buffers use %" PRId64
+                " MiB, host free=%" PRId64 " MiB, safety margin=%" PRId64
+                " MiB, baseline=%" PRId64 " MiB\n",
                 func_name, host_increment/MiB, host_free/MiB, host_margin/MiB, host_baseline_used/MiB);
         }
         return ret;
@@ -637,7 +681,7 @@ static void common_params_fit_impl(
         }
         if (ngl_per_device_high[id].n_layer > 0) {
             std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-            const bool host_ok_high = last_host_candidate_ok;
+            const bool host_ok_high = last_host_candidate_ok && last_shared_uma_candidate_ok;
             if (!host_ok_high || mem_high[id] > targets[id]) {
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
@@ -658,7 +702,7 @@ static void common_params_fit_impl(
                     }
                     const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                    const bool host_ok_test = last_host_candidate_ok;
+                    const bool host_ok_test = last_host_candidate_ok && last_shared_uma_candidate_ok;
                     if (host_ok_test && mem_test[id] <= targets[id]) {
                         ngl_per_device = ngl_per_device_test;
                         mem            = mem_test;
@@ -721,7 +765,7 @@ static void common_params_fit_impl(
         size_t id_dense_start_high = nd - 1;
         std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
 
-        const bool host_ok_high = last_host_candidate_ok;
+        const bool host_ok_high = last_host_candidate_ok && last_shared_uma_candidate_ok;
         if (!host_ok_high || mem_high[id] > targets[id]) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
@@ -749,7 +793,7 @@ static void common_params_fit_impl(
                 }
                 const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
-                const bool host_ok_test = last_host_candidate_ok;
+                const bool host_ok_test = last_host_candidate_ok && last_shared_uma_candidate_ok;
                 if (host_ok_test && mem_test[id] <= targets[id]) {
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
@@ -794,7 +838,7 @@ static void common_params_fit_impl(
             }
             LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
             std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-            const bool host_ok_test_up = last_host_candidate_ok;
+            const bool host_ok_test_up = last_host_candidate_ok && last_shared_uma_candidate_ok;
             if (host_ok_test_up && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
@@ -807,7 +851,7 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                const bool host_ok_test = last_host_candidate_ok;
+                const bool host_ok_test = last_host_candidate_ok && last_shared_uma_candidate_ok;
                 if (host_ok_test && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
@@ -821,7 +865,7 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                const bool host_ok_test_attn = last_host_candidate_ok;
+                const bool host_ok_test_attn = last_host_candidate_ok && last_shared_uma_candidate_ok;
                 if (host_ok_test_attn && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
