@@ -857,10 +857,14 @@ enum common_params_fit_status common_fit_params(
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
-        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+        // Do not silently continue into model loading with the pre-fit/default
+        // placement. A failed fit means no placement satisfying the memory
+        // constraints was found; continuing can fall back to an unsafe
+        // OpenCL/CPU placement and trigger a real allocation/repack crash.
+        throw;
     } catch (const std::runtime_error & e) {
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
-        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+        throw;
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
