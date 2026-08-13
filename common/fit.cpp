@@ -87,9 +87,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             continue;
         }
 
-        // CPU backend buffers (including CPU_REPACK) consume host/UMA memory.
-        // Keep them in the host bucket so --fit can account for their actual
-        // candidate-dependent cost without changing any other backend's accounting.
+        // CPU backend buffers (including CPU_REPACK) consume the same physical
+        // host/UMA memory pool.  Keep them in the host bucket, without changing
+        // any dedicated-device memory accounting.
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
@@ -207,6 +207,11 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
+
+    // The initial host footprint is the baseline already implied by the current
+    // model/context configuration.  Candidate checks below only charge the
+    // additional host/UMA footprint introduced by the candidate.
+    const int64_t host_baseline_used = static_cast<int64_t>(dmds_full.back().mb.total());
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -510,10 +515,9 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tensor_buft_overrides;
     };
 
-    // Whether the most recently tested placement fits in the host/UMA budget.
-    // This is intentionally kept separate from per-device memory: HTP reports 0/0
-    // and CPU_REPACK is a shared host-memory consumer, so it must not be encoded
-    // by fabricating a device total or by unsigned subtraction.
+    // v15: host/UMA candidate state is kept separate from per-device memory.  HTP
+    // may report 0/0, so it must never be represented by a fabricated device
+    // capacity or by unsigned subtraction.
     bool last_host_candidate_ok = true;
     bool selected_host_candidate_ok = false;
 
@@ -542,18 +546,21 @@ static void common_params_fit_impl(
             ret.push_back(dmd_nl[id].mb.total());
         }
 
-        // CPU_REPACK and other CPU backend buffers are shared host/UMA memory.
-        // Do not turn a host-budget failure into a fake device-memory value: that
-        // was the source of the v12 unsigned-underflow/2^41-MiB readings.
-        const int64_t host_used   = static_cast<int64_t>(dmd_nl.back().mb.total());
-        const int64_t host_free   = static_cast<int64_t>(dmd_nl.back().free);
+        // CPU_REPACK and ordinary CPU/host buffers share the system DDR pool.
+        // Charge only the candidate's incremental host footprint against the
+        // currently free host memory.  Do not add the baseline twice and do not
+        // manufacture a memory total for HTP's 0/0 report.
+        const int64_t host_candidate_used = static_cast<int64_t>(dmd_nl.back().mb.total());
+        const int64_t host_increment = std::max<int64_t>(0, host_candidate_used - host_baseline_used);
+        const int64_t host_free = static_cast<int64_t>(dmd_nl.back().free);
         const int64_t host_margin = std::max<int64_t>(MiB, host_free / 20);
-        last_host_candidate_ok = host_used + host_margin <= host_free;
+        const int64_t host_budget = std::max<int64_t>(0, host_free - host_margin);
+        last_host_candidate_ok = host_increment <= host_budget;
         if (!last_host_candidate_ok) {
             LOG_TRC(
-                "%s: host/UMA candidate rejected: CPU/host buffers use %" PRId64
-                " MiB, host free=%" PRId64 " MiB, safety margin=%" PRId64 " MiB\n",
-                func_name, host_used/MiB, host_free/MiB, host_margin/MiB);
+                "%s: host/UMA candidate rejected: incremental CPU/host buffers use %" PRId64
+                " MiB, host free=%" PRId64 " MiB, safety margin=%" PRId64 " MiB, baseline=%" PRId64 " MiB\n",
+                func_name, host_increment/MiB, host_free/MiB, host_margin/MiB, host_baseline_used/MiB);
         }
         return ret;
     };
@@ -650,8 +657,8 @@ static void common_params_fit_impl(
                             step_size - 1 : step_size; // the first layer is the output layer which must always be full
                     }
                     const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
-                    const bool host_ok_test = last_host_candidate_ok;
 
+                    const bool host_ok_test = last_host_candidate_ok;
                     if (host_ok_test && mem_test[id] <= targets[id]) {
                         ngl_per_device = ngl_per_device_test;
                         mem            = mem_test;
@@ -679,6 +686,10 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+        if (!selected_host_candidate_ok) {
+            throw common_params_fit_exception(
+                "no --fit placement satisfies the host/UMA memory budget after incremental CPU_REPACK accounting");
+        }
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -709,13 +720,16 @@ static void common_params_fit_impl(
         }
         size_t id_dense_start_high = nd - 1;
         std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
-        const bool host_ok_high = last_host_candidate_ok;
 
+        const bool host_ok_high = last_host_candidate_ok;
         if (!host_ok_high || mem_high[id] > targets[id]) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
             while (delta > 1) {
-                uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                const int64_t mem_delta = mem_high[id] - mem[id];
+                uint32_t step_size = mem_delta > 0
+                    ? int64_t(delta) * (targets[id] - mem[id]) / mem_delta
+                    : uint32_t(1);
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
 
@@ -734,8 +748,8 @@ static void common_params_fit_impl(
                     }
                 }
                 const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
-                const bool host_ok_test = last_host_candidate_ok;
 
+                const bool host_ok_test = last_host_candidate_ok;
                 if (host_ok_test && mem_test[id] <= targets[id]) {
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
@@ -793,8 +807,8 @@ static void common_params_fit_impl(
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
-                const bool host_ok_test_gate = last_host_candidate_ok;
-                if (host_ok_test_gate && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
+                const bool host_ok_test = last_host_candidate_ok;
+                if (host_ok_test && mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
@@ -812,6 +826,7 @@ static void common_params_fit_impl(
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
+                    selected_host_candidate_ok = true;
                     id_dense_start = id_dense_start_test;
                     LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
@@ -835,7 +850,7 @@ static void common_params_fit_impl(
 
     if (!selected_host_candidate_ok) {
         throw common_params_fit_exception(
-            "no --fit placement satisfies the host/UMA memory budget after CPU_REPACK accounting");
+            "no --fit placement satisfies the host/UMA memory budget after incremental CPU_REPACK accounting");
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
@@ -857,14 +872,10 @@ enum common_params_fit_status common_fit_params(
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
-        // Do not silently continue into model loading with the pre-fit/default
-        // placement. A failed fit means no placement satisfying the memory
-        // constraints was found; continuing can fall back to an unsafe
-        // OpenCL/CPU placement and trigger a real allocation/repack crash.
-        throw;
+        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
     } catch (const std::runtime_error & e) {
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
-        throw;
+        status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
