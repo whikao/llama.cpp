@@ -32,9 +32,13 @@ class common_params_fit_exception : public std::runtime_error {
 };
 
 // Read Linux/Android memory pressure indicators without changing fit policy.
-// These values are diagnostic only for now: the actual HTP/shared-UMA budget
-// remains governed by the existing fit accounting until we have real-device
-// measurements to choose a safe reserve.
+// Shared-UMA policy for Qualcomm HTP + OpenCL on Android/SM8850.
+// HTP reports 0/0 instead of a real DDR pool, so it must not inherit the
+// complete host-memory figure.  The HTP session mapping cap is treated as a
+// conservative ceiling, while the actual fit budget is the smaller shared
+// UMA runtime budget.  CPU_REPACK is transient host-side pressure, so keep a
+// separate small headroom reserve for it rather than pretending its virtual
+// mapping size is all resident physical RAM.
 struct common_memprobe_t {
     int64_t mem_available = -1;
     int64_t mem_free      = -1;
@@ -380,6 +384,8 @@ static void common_params_fit_impl(
     // runtime allocations still need headroom.  Keep the reserve conservative
     // and, importantly, apply it only when an HTP backend is present.
     constexpr int64_t SHARED_UMA_SAFETY_RESERVE = 1536LL * MiB;
+    constexpr int64_t CPU_REPACK_SAFETY_RESERVE = 512LL * MiB;
+    constexpr int64_t HTP_SESSION_MEMORY_CAP = 3584LL * MiB;
     int64_t shared_uma_runtime_free = 0;
 
     for (size_t id = 0; id < nd; id++) {
@@ -402,14 +408,22 @@ static void common_params_fit_impl(
         const common_memprobe_t probe = common_memprobe_linux();
         if (probe.mem_available >= 0) {
             const int64_t mem_available = probe.mem_available * 1024;
-            shared_uma_runtime_free = std::max<int64_t>(0, mem_available - SHARED_UMA_SAFETY_RESERVE);
+            const int64_t runtime_headroom = SHARED_UMA_SAFETY_RESERVE + CPU_REPACK_SAFETY_RESERVE;
+            shared_uma_runtime_free = std::max<int64_t>(0, mem_available - runtime_headroom);
             shared_uma_free = std::min(shared_uma_free, shared_uma_runtime_free);
-            LOG_TRC("%s: shared UMA safety: MemAvailable=%" PRId64 " MiB, reserve=%" PRId64 " MiB, budget=%" PRId64 " MiB\n",
-                    __func__, mem_available/MiB, SHARED_UMA_SAFETY_RESERVE/MiB, shared_uma_free/MiB);
+            LOG_TRC("%s: shared UMA safety: MemAvailable=%" PRId64 " MiB, system_reserve=%" PRId64
+                    " MiB, cpu_repack_reserve=%" PRId64 " MiB, budget=%" PRId64 " MiB\n",
+                    __func__, mem_available/MiB, SHARED_UMA_SAFETY_RESERVE/MiB,
+                    CPU_REPACK_SAFETY_RESERVE/MiB, shared_uma_free/MiB);
         } else {
             shared_uma_runtime_free = shared_uma_free;
             LOG_WRN("%s: shared UMA safety: MemAvailable unavailable; using backend host-memory value\n", __func__);
         }
+    }
+
+    if (has_shared_uma) {
+        LOG_TRC("%s: shared UMA policy: HTP session cap=%" PRId64 " MiB, CPU_REPACK headroom=%" PRId64 " MiB\n",
+                __func__, HTP_SESSION_MEMORY_CAP/MiB, CPU_REPACK_SAFETY_RESERVE/MiB);
     }
 
     auto total_margin = [&]() -> int64_t {
@@ -808,8 +822,8 @@ static void common_params_fit_impl(
     }
 
     // For a shared-physical-memory device, the target is constrained by both
-    // its native backend-reported free memory and the remaining shared DDR
-    // pool. Host memory required by the candidate parameters is part of that
+    // its native backend-reported free memory (or HTP session cap) and the
+    // remaining shared DDR pool. Host memory required by the candidate parameters is part of that
     // shared pool and is counted once below.  For a zero/zero HTP device, the
     // shared UMA budget is the only meaningful capacity; INT64_MAX is used only
     // as the native-cap side of the min() and is never exposed as a real HTP
@@ -817,9 +831,9 @@ static void common_params_fit_impl(
     auto target_for_device = [&](size_t id, const std::vector<int64_t> & mem) -> int64_t {
         // HTP reports 0/0 because it has no independent device-memory pool.
         // In the shared-UMA mode its budget comes from the physical DDR pool,
-        // so a zero native report must not turn the HTP target negative.
+        // so a zero native report is bounded by the conservative HTP session cap.
         const int64_t native_target = htp_zero_memory[id]
-            ? INT64_MAX
+            ? HTP_SESSION_MEMORY_CAP
             : int64_t(dmds_full[id].free) - margins[id];
         if (!shared_physical_memory[id]) {
             return native_target;
