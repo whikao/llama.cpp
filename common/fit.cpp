@@ -9,6 +9,10 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <cstring>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
 #include <set>
 #include <string>
 #include <vector>
@@ -26,6 +30,85 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+// Read Linux/Android memory pressure indicators without changing fit policy.
+// These values are diagnostic only for now: the actual HTP/shared-UMA budget
+// remains governed by the existing fit accounting until we have real-device
+// measurements to choose a safe reserve.
+struct common_memprobe_t {
+    int64_t mem_available = -1;
+    int64_t mem_free      = -1;
+    int64_t vm_rss        = -1;
+    int64_t vm_size       = -1;
+};
+
+static int64_t common_read_kib_value(const std::string & line, const char * key) {
+    if (line.rfind(key, 0) != 0) {
+        return -1;
+    }
+    std::istringstream iss(line.substr(std::strlen(key)));
+    int64_t value = -1;
+    std::string unit;
+    if (!(iss >> value)) {
+        return -1;
+    }
+    if (iss >> unit) {
+        if (unit == "kB") {
+            return value;
+        }
+    }
+    return value;
+}
+
+static common_memprobe_t common_memprobe_linux() {
+    common_memprobe_t ret;
+#if defined(__linux__)
+    {
+        std::ifstream f("/proc/meminfo");
+        std::string line;
+        while (std::getline(f, line)) {
+            const int64_t value = common_read_kib_value(line, "MemAvailable:");
+            if (value >= 0) {
+                ret.mem_available = value;
+                continue;
+            }
+            const int64_t value_free = common_read_kib_value(line, "MemFree:");
+            if (value_free >= 0) {
+                ret.mem_free = value_free;
+            }
+        }
+    }
+    {
+        std::ifstream f("/proc/self/status");
+        std::string line;
+        while (std::getline(f, line)) {
+            const int64_t value = common_read_kib_value(line, "VmRSS:");
+            if (value >= 0) {
+                ret.vm_rss = value;
+                continue;
+            }
+            const int64_t value_size = common_read_kib_value(line, "VmSize:");
+            if (value_size >= 0) {
+                ret.vm_size = value_size;
+            }
+        }
+    }
+#endif
+    return ret;
+}
+
+static void common_memprobe_log(const char * tag) {
+    const common_memprobe_t m = common_memprobe_linux();
+    if (m.mem_available < 0 && m.mem_free < 0 && m.vm_rss < 0 && m.vm_size < 0) {
+        LOG_TRC("%s: Linux/Android memory probe unavailable
+", tag);
+        return;
+    }
+    LOG_TRC("%s: memprobe: MemAvailable=%" PRId64 " MiB, MemFree=%" PRId64
+            " MiB, VmRSS=%" PRId64 " MiB, VmSize=%" PRId64 " MiB\n",
+            tag, m.mem_available / 1024, m.mem_free / 1024,
+            m.vm_rss / 1024, m.vm_size / 1024);
+}
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -202,6 +285,11 @@ static void common_params_fit_impl(
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
+
+    // Diagnostic snapshot: do not feed this directly into the fit budget yet.
+    // We first need real SM8850 measurements from OpenCL-only, HTP-only and
+    // HTP+OpenCL runs to determine an evidence-based safety reserve.
+    common_memprobe_log("%s: initial", __func__);
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -767,6 +855,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
+        common_memprobe_log("%s: final dense placement", __func__);
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
     }
@@ -916,6 +1005,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
+    common_memprobe_log("%s: final MoE placement", __func__);
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
