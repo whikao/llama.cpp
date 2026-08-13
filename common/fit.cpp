@@ -100,8 +100,7 @@ static common_memprobe_t common_memprobe_linux() {
 static void common_memprobe_log(const char * tag) {
     const common_memprobe_t m = common_memprobe_linux();
     if (m.mem_available < 0 && m.mem_free < 0 && m.vm_rss < 0 && m.vm_size < 0) {
-        LOG_TRC("%s: Linux/Android memory probe unavailable
-", tag);
+        LOG_TRC("%s: Linux/Android memory probe unavailable\n", tag);
         return;
     }
     LOG_TRC("%s: memprobe: MemAvailable=%" PRId64 " MiB, MemFree=%" PRId64
