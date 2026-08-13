@@ -114,12 +114,17 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
-        // Hexagon uses UMA (unified memory), so HTP can use host memory as a fallback.
+        // UMA devices (e.g. Hexagon/HTP and integrated accelerators) may report
+        // 0/0 because their memory is shared with the host. Only skip GPU-like
+        // devices when they use dedicated memory and cannot report a budget.
         if (free == 0 && total == 0) {
             const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            const std::string dev_name = ggml_backend_dev_name(dev);
-            const bool is_htp = dev_name.rfind("HTP", 0) == 0;
-            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && !is_htp) {
+            const enum ggml_backend_dev_memory_type memory_type =
+                ggml_backend_dev_memory_type(dev);
+
+            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                 type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                memory_type == GGML_BACKEND_DEVICE_MEMORY_TYPE_DEDICATED) {
                 LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
                         __func__, ggml_backend_dev_name(dev));
             } else {
