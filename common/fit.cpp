@@ -360,11 +360,14 @@ static void common_params_fit_impl(
 
         unified_memory.push_back(is_unified);
         htp_zero_memory.push_back(zero_memory_reported);
-        // Only activate the shared physical-memory accounting when HTP is
-        // present. This keeps OpenCL-only behavior identical to upstream.
-        // Once HTP is present, all unified devices (including OpenCL) consume
-        // the same physical DDR pool, while OpenCL still keeps its native cap.
-        shared_physical_memory.push_back(has_htp_backend && is_unified);
+        // Activate shared physical-memory accounting when HTP is present.
+        // Qualcomm HTP may report a 0/0 native memory pool and may not expose
+        // GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED, even though its allocations
+        // are backed by the same system DDR as the CPU/OpenCL side.  Therefore
+        // a zero-memory HTP device must also be treated as a shared-UMA
+        // consumer.  OpenCL-only builds remain unchanged because has_htp_backend
+        // is false in that case.
+        shared_physical_memory.push_back(has_htp_backend && (is_unified || zero_memory_reported));
     }
 
     int64_t shared_uma_free   = 0;
@@ -779,7 +782,11 @@ static void common_params_fit_impl(
                     global_surplus_cpu_moe -= int64_t(dmds_cpu_moe[id].mb.total()) + margins[id];
                 }
             }
-            global_surplus_cpu_moe += int64_t(dmds_cpu_moe.back().free) - shared_used - shared_uma_margin;
+            // Use the same safety-capped shared UMA budget here.  The host
+            // backend's native free value can be much larger than the actual
+            // Android MemAvailable budget and would otherwise let the MoE
+            // placement stage bypass the shared-UMA safety layer.
+            global_surplus_cpu_moe += shared_uma_free - shared_used - shared_uma_margin;
         } else {
             for (size_t id = 0; id < nd; id++) {
                 global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -803,7 +810,10 @@ static void common_params_fit_impl(
     // For a shared-physical-memory device, the target is constrained by both
     // its native backend-reported free memory and the remaining shared DDR
     // pool. Host memory required by the candidate parameters is part of that
-    // shared pool and is counted once below.
+    // shared pool and is counted once below.  For a zero/zero HTP device, the
+    // shared UMA budget is the only meaningful capacity; INT64_MAX is used only
+    // as the native-cap side of the min() and is never exposed as a real HTP
+    // memory budget.
     auto target_for_device = [&](size_t id, const std::vector<int64_t> & mem) -> int64_t {
         // HTP reports 0/0 because it has no independent device-memory pool.
         // In the shared-UMA mode its budget comes from the physical DDR pool,
