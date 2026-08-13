@@ -199,6 +199,10 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // Optional memory architecture callback. Kept at the end so existing
+        // backend device initializers remain source-compatible.
+        enum ggml_backend_dev_memory_type (*get_memory_type)(ggml_backend_dev_t dev);
     };
 
     struct ggml_backend_device {

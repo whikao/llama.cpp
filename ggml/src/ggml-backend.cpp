@@ -585,10 +585,38 @@ enum ggml_backend_dev_type ggml_backend_dev_type(ggml_backend_dev_t device) {
     return device->iface.get_type(device);
 }
 
+static enum ggml_backend_dev_memory_type ggml_backend_dev_memory_type_fallback(ggml_backend_dev_t device) {
+    const enum ggml_backend_dev_type type = device->iface.get_type(device);
+
+    // Preserve the historical memory assumptions for legacy backends that do
+    // not provide an explicit memory-type callback yet.
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+        case GGML_BACKEND_DEVICE_TYPE_CPU:
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return GGML_BACKEND_DEVICE_MEMORY_TYPE_HOST;
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        default:
+            return GGML_BACKEND_DEVICE_MEMORY_TYPE_DEDICATED;
+    }
+}
+
+enum ggml_backend_dev_memory_type ggml_backend_dev_memory_type(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+    if (device->iface.get_memory_type != NULL) {
+        return device->iface.get_memory_type(device);
+    }
+    return ggml_backend_dev_memory_type_fallback(device);
+}
+
 void ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props) {
     GGML_ASSERT(device);
     memset(props, 0, sizeof(*props));
     device->iface.get_props(device, props);
+    // Keep the public properties structure consistent for legacy backends too.
+    props->memory_type = ggml_backend_dev_memory_type(device);
 }
 
 ggml_backend_reg_t ggml_backend_dev_backend_reg(ggml_backend_dev_t device) {
