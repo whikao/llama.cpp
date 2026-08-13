@@ -72,6 +72,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
 
+    // A single unified-memory accelerator (notably Hexagon/HTP) shares the
+    // same physical RAM pool as the host and CPU-side auxiliary buffers.
+    const bool single_uma_device = nd == 1 &&
+        ggml_backend_dev_memory_type(llama_model_get_device(model, 0)) ==
+            GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
     for (const auto & [buft, mb] : memory_breakdown) {
@@ -86,13 +92,27 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         if (!dev) {
             continue;
         }
+
+        bool matched_model_device = false;
         for (size_t i = 0; i < nd; i++) {
             if (dev == llama_model_get_device(model, i)) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
+                matched_model_device = true;
                 break;
             }
+        }
+
+        // CPU_REPACK and similar CPU-owned buffer types are not necessarily
+        // reported by ggml_backend_buft_is_host().  In an UMA configuration
+        // they still consume the exact same physical RAM as HTP, so account
+        // every unmatched HOST-memory device buffer on the host side.
+        if (!matched_model_device && single_uma_device &&
+            ggml_backend_dev_memory_type(dev) == GGML_BACKEND_DEVICE_MEMORY_TYPE_HOST) {
+            ret.back().mb.model   += mb.model;
+            ret.back().mb.context += mb.context;
+            ret.back().mb.compute += mb.compute;
         }
     }
 
@@ -107,15 +127,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().free  = free;
         ret.back().total = total;
     }
-    // A single unified-memory accelerator (notably Hexagon/HTP) shares the
-    // same physical RAM budget as the host. For --fit, account both the
-    // accelerator-side buffers and all host-side buffers against that one
-    // shared budget. This is important for CPU_REPACK: those allocations are
-    // host allocations even when most model layers are assigned to HTP.
-    const bool single_uma_device = nd == 1 &&
-        ggml_backend_dev_memory_type(llama_model_get_device(model, 0)) ==
-            GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
-
     for (size_t i = 0; i < nd; i++) {
         ggml_backend_dev_t dev = llama_model_get_device(model, i);
 
