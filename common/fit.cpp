@@ -4,6 +4,7 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -72,11 +73,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
 
-    // A single unified-memory accelerator (notably Hexagon/HTP) shares the
-    // same physical RAM pool as the host and CPU-side auxiliary buffers.
-    const bool single_uma_device = nd == 1 &&
-        ggml_backend_dev_memory_type(llama_model_get_device(model, 0)) ==
-            GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+    // Unified-memory accelerators (notably Hexagon/HTP) share the same
+    // physical RAM pool as the host and CPU-side auxiliary buffers.  Multiple
+    // HTP logical devices are one UMA group, not independent VRAM pools.
+    bool all_uma_devices = nd > 0;
+    for (size_t i = 0; i < nd; ++i) {
+        all_uma_devices = all_uma_devices &&
+            ggml_backend_dev_memory_type(llama_model_get_device(model, i)) ==
+                GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+    }
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
@@ -108,7 +113,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         // reported by ggml_backend_buft_is_host().  In an UMA configuration
         // they still consume the exact same physical RAM as HTP, so account
         // every unmatched HOST-memory device buffer on the host side.
-        if (!matched_model_device && single_uma_device &&
+        if (!matched_model_device && all_uma_devices &&
             ggml_backend_dev_memory_type(dev) == GGML_BACKEND_DEVICE_MEMORY_TYPE_HOST) {
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
@@ -137,22 +142,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
         const enum ggml_backend_dev_memory_type memory_type = ggml_backend_dev_memory_type(dev);
 
-        if (single_uma_device && i == 0) {
-            // HTP may correctly report 0/0 because it has no dedicated VRAM.
-            // Use the host RAM as the one physical budget, and fold every host
-            // allocation into the HTP accounting so --fit cannot count the
-            // same RAM twice or ignore CPU/CPU_REPACK usage.
+        if (all_uma_devices) {
+            // Every HTP logical device belongs to the same UMA pool.  Expose
+            // the host budget for reporting, but do NOT fold host allocations
+            // into each device here (that would multiply-count them for nd>1).
             free  = ret.back().free;
             total = ret.back().total;
-
-            ret[i].mb.model   += ret.back().mb.model;
-            ret[i].mb.context += ret.back().mb.context;
-            ret[i].mb.compute += ret.back().mb.compute;
-
-            LOG_TRC("%s: device %s uses unified host memory; --fit shared budget = %zu MiB free / %zu MiB total, shared use = %zu MiB\n",
-                    __func__, ggml_backend_dev_name(dev),
-                    free / (1024 * 1024), total / (1024 * 1024),
-                    ret[i].mb.total() / (1024 * 1024));
         } else if (free == 0 && total == 0) {
             // Preserve the existing behavior for non-UMA devices. A dedicated
             // GPU that cannot report a memory budget is not usable by --fit.
@@ -168,6 +163,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         ret[i].free  = free;
         ret[i].total = total;
+    }
+
+    if (all_uma_devices) {
+        size_t shared_use = ret.back().mb.total();
+        for (size_t i = 0; i < nd; ++i) {
+            shared_use += ret[i].mb.total();
+        }
+        LOG_TRC("%s: %zu unified devices share one host memory pool; --fit shared budget = %zu MiB free / %zu MiB total, shared use = %zu MiB\n",
+                __func__, nd, ret.back().free / (1024 * 1024), ret.back().total / (1024 * 1024),
+                shared_use / (1024 * 1024));
     }
 
     devs.clear();
@@ -261,6 +266,115 @@ static void common_params_fit_impl(
         for (std::string & dn : dev_names) {
             dn.insert(dn.end(), max_length - dn.length(), ' ');
         }
+    }
+
+    bool uma_group = nd > 0;
+    for (const auto & dev : devs) {
+        uma_group = uma_group &&
+            ggml_backend_dev_memory_type(dev) == GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED;
+    }
+
+    // All logical HTP devices share one physical host RAM pool.  The generic
+    // multi-device fitter assumes independent memory pools, so using it here
+    // would multiply a 15 GiB host budget by HTP0..HTP3.  Handle this case as
+    // one UMA group and test the actual aggregate allocation instead.
+    if (uma_group) {
+        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+            throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        }
+        if (nd > 1) {
+            if (!tensor_split) {
+                throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
+            }
+            if (mparams->tensor_split) {
+                for (size_t id = 0; id < nd; ++id) {
+                    if (mparams->tensor_split[id] != 0.0f) {
+                        throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
+                    }
+                }
+            }
+            if (mparams->split_mode == LLAMA_SPLIT_MODE_ROW) {
+                throw common_params_fit_exception("changing weight allocation for LLAMA_SPLIT_MODE_ROW not implemented, abort");
+            }
+        }
+        if (!tensor_buft_overrides) {
+            throw common_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
+        }
+        if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
+            throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
+        }
+
+        auto shared_used = [&](const dmds_t & dmds) -> int64_t {
+            int64_t used = dmds.back().mb.total(); // Host + CPU + CPU_REPACK
+            for (size_t id = 0; id < nd; ++id) {
+                used += dmds[id].mb.total();       // HTP0..HTPn
+            }
+            return used;
+        };
+
+        const int64_t shared_free   = dmds_full.back().free;
+        const int64_t shared_margin = *std::max_element(margins.begin(), margins.end());
+        const int64_t shared_target = shared_free - shared_margin;
+        const int64_t initial_used  = shared_used(dmds_full);
+
+        LOG_TRC("%s: %zu unified devices use one UMA pool: %" PRId64 " MiB used, %" PRId64 " MiB available, target %" PRId64 " MiB after margin\n",
+                __func__, nd, initial_used/MiB, shared_free/MiB, shared_target/MiB);
+
+        if (initial_used <= shared_target) {
+            LOG_TRC("%s: UMA group already fits; no changes needed\n", __func__);
+            return;
+        }
+
+        if (cparams->n_ctx != 0) {
+            LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
+        }
+
+        // Keep layer distribution balanced across the logical HTP devices and
+        // search from maximum offload downward.  We evaluate the real aggregate
+        // UMA footprint for every candidate, so CPU_REPACK growth is included
+        // and no monotonic-memory assumption is required.
+        std::vector<float> test_split(nd, 1.0f);
+        int best_ngl = -1;
+        int64_t best_used = 0;
+
+        for (int ngl = int(hp_ngl) + 1; ngl >= 0; --ngl) {
+            llama_model_params mparams_test = *mparams;
+            mparams_test.n_gpu_layers = ngl;
+            mparams_test.tensor_split = nd > 1 ? test_split.data() : nullptr;
+            mparams_test.tensor_buft_overrides = nullptr;
+
+            const dmds_t dmds_test = common_get_device_memory_data_impl(
+                path_model, &mparams_test, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            const int64_t used = shared_used(dmds_test);
+
+            LOG_TRC("%s: UMA test n_gpu_layers=%d -> shared use %" PRId64 " MiB vs target %" PRId64 " MiB\n",
+                    __func__, ngl, used/MiB, shared_target/MiB);
+
+            if (used <= shared_target) {
+                best_ngl = ngl;
+                best_used = used;
+                break;
+            }
+        }
+
+        if (best_ngl < 0) {
+            throw common_params_fit_exception(
+                "unable to fit model into the shared UMA memory pool (including CPU_REPACK and host buffers)");
+        }
+
+        mparams->n_gpu_layers = best_ngl;
+        if (nd > 1) {
+            for (size_t id = 0; id < nd; ++id) {
+                tensor_split[id] = 1.0f;
+            }
+            mparams->tensor_split = tensor_split;
+        }
+        tensor_buft_overrides[0] = {nullptr, nullptr};
+        mparams->tensor_buft_overrides = tensor_buft_overrides;
+
+        LOG_TRC("%s: UMA group fit selected n_gpu_layers=%d, shared use %" PRId64 " MiB, leaving %" PRId64 " MiB\n",
+                __func__, best_ngl, best_used/MiB, (shared_free - best_used)/MiB);
+        return;
     }
 
     int64_t sum_free            = 0;
