@@ -286,7 +286,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
 
     // Diagnostic snapshot: do not feed this directly into the fit budget yet.
@@ -424,6 +424,32 @@ static void common_params_fit_impl(
     if (has_shared_uma) {
         LOG_TRC("%s: shared UMA policy: HTP session cap=%" PRId64 " MiB, CPU_REPACK headroom=%" PRId64 " MiB\n",
                 __func__, HTP_SESSION_MEMORY_CAP/MiB, CPU_REPACK_SAFETY_RESERVE/MiB);
+    }
+
+    // v9: make the shared-UMA budget visible to the fit core itself.  HTP
+    // commonly reports 0/0, and the previous versions only constrained the
+    // target calculation while leaving the raw device snapshot at the host
+    // memory size (e.g. 15003 MiB on SM8850).  That makes HTP look like a
+    // separate large memory pool and biases layer placement toward HTP.
+    //
+    // For a zero/zero HTP device, replace its synthetic memory view with a
+    // conservative session cap, additionally limited by the current shared
+    // UMA runtime budget.  Do not change OpenCL's native total/free values: its
+    // driver-reported capacity remains a useful per-backend cap, while the
+    // shared UMA pool below enforces the physical DDR constraint across HTP
+    // and OpenCL.
+    if (has_shared_uma) {
+        for (size_t id = 0; id < nd; ++id) {
+            if (!htp_zero_memory[id]) {
+                continue;
+            }
+            const int64_t htp_budget = std::min(HTP_SESSION_MEMORY_CAP, shared_uma_free);
+            dmds_full[id].total = size_t(std::max<int64_t>(0, htp_budget));
+            dmds_full[id].free  = size_t(std::max<int64_t>(0, htp_budget));
+            LOG_TRC("%s: HTP shared-UMA device cap: id=%zu, total=%" PRId64
+                    " MiB, free=%" PRId64 " MiB (UMA budget=%" PRId64 " MiB)\n",
+                    __func__, id, htp_budget/MiB, htp_budget/MiB, shared_uma_free/MiB);
+        }
     }
 
     auto total_margin = [&]() -> int64_t {
