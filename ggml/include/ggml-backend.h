@@ -132,16 +132,28 @@ extern "C" {
     //
 
     enum ggml_backend_dev_type {
-        // CPU device using system memory
+        // CPU device
         GGML_BACKEND_DEVICE_TYPE_CPU,
-        // GPU device using dedicated memory
+        // GPU device
         GGML_BACKEND_DEVICE_TYPE_GPU,
-        // integrated GPU device using host memory
+        // integrated GPU device
         GGML_BACKEND_DEVICE_TYPE_IGPU,
         // accelerator devices intended to be used together with the CPU backend (e.g. BLAS or AMX)
         GGML_BACKEND_DEVICE_TYPE_ACCEL,
         // "meta" device wrapping multiple other devices for tensor parallelism
         GGML_BACKEND_DEVICE_TYPE_META,
+    };
+
+    // memory architecture used by a backend device.  This is intentionally
+    // separate from ggml_backend_dev_type: a GPU can use either dedicated
+    // memory or a unified host/device memory pool.
+    enum ggml_backend_dev_memory_type {
+        // device using dedicated memory (e.g. discrete GPU)
+        GGML_BACKEND_DEVICE_MEMORY_TYPE_DEDICATED,
+        // device using unified memory shared with the host (UMA)
+        GGML_BACKEND_DEVICE_MEMORY_TYPE_UNIFIED,
+        // device using only host system memory
+        GGML_BACKEND_DEVICE_MEMORY_TYPE_HOST,
     };
 
     // functionality supported by the device
@@ -170,6 +182,8 @@ extern "C" {
         size_t memory_total;
         // device type
         enum ggml_backend_dev_type type;
+        // device memory architecture
+        enum ggml_backend_dev_memory_type memory_type;
         // device id
         //   for PCI devices, this should be the lower-case PCI bus id formatted as "domain:bus:device.function" (e.g. "0000:c1:00.0")
         //   if the id is unknown, this should be NULL
@@ -181,8 +195,9 @@ extern "C" {
     GGML_API const char *                  ggml_backend_dev_name(ggml_backend_dev_t device);
     GGML_API const char *                  ggml_backend_dev_description(ggml_backend_dev_t device);
     GGML_API void                          ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total);
-    GGML_API enum ggml_backend_dev_type    ggml_backend_dev_type(ggml_backend_dev_t device);
-    GGML_API void                          ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props);
+    GGML_API enum ggml_backend_dev_type          ggml_backend_dev_type(ggml_backend_dev_t device);
+    GGML_API enum ggml_backend_dev_memory_type   ggml_backend_dev_memory_type(ggml_backend_dev_t device);
+    GGML_API void                                ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props);
     GGML_API ggml_backend_reg_t            ggml_backend_dev_backend_reg(ggml_backend_dev_t device);
     GGML_API ggml_backend_t                ggml_backend_dev_init(ggml_backend_dev_t device, const char * params);
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_buffer_type(ggml_backend_dev_t device);
