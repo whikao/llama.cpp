@@ -1,0 +1,120 @@
+name: Build llama.cpp Android CPU + Hexagon (UMA fit)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout llama.cpp
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify Hexagon UMA fit patch
+        run: |
+          set -euo pipefail
+          test -f common/fit.cpp
+          grep -q 'common_fit_is_hexagon_uma' common/fit.cpp || {
+            echo 'ERROR: common/fit.cpp does not contain the Hexagon UMA fit patch.'
+            echo 'Replace common/fit.cpp with the provided fit.cpp before running this workflow.'
+            exit 1
+          }
+
+      - name: Build Android CPU + Hexagon only
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -u "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            ghcr.io/snapdragon-toolchain/arm64-android:v0.7 \
+            bash -lc '
+              set -euo pipefail
+              cd /workspace
+
+              echo "=== Toolchain environment ==="
+              echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+              echo "HEXAGON_SDK_ROOT=$HEXAGON_SDK_ROOT"
+              echo "HEXAGON_TOOLS_ROOT=$HEXAGON_TOOLS_ROOT"
+
+              cp docs/backend/snapdragon/CMakeUserPresets.json .
+              rm -rf build-snapdragon pkg-snapdragon
+
+              echo "=== Configure: CPU + Hexagon only ==="
+              cmake --preset arm64-android-snapdragon-release \
+                -B build-snapdragon \
+                -DBUILD_SHARED_LIBS=ON \
+                -DGGML_HEXAGON=ON \
+                -DGGML_OPENCL=OFF \
+                -DGGML_VULKAN=OFF \
+                -DGGML_OPENMP=OFF \
+                -DGGML_LLAMAFILE=OFF \
+                -DGGML_CPU_REPACK=ON \
+                -DLLAMA_BUILD_TESTS=OFF \
+                -DLLAMA_BUILD_EXAMPLES=ON \
+                -DLLAMA_BUILD_SERVER=ON
+
+              echo "=== Verify configured backends ==="
+              grep -E "^(GGML_HEXAGON|GGML_OPENCL|GGML_VULKAN|GGML_CPU_REPACK):" build-snapdragon/CMakeCache.txt || true
+              grep -q "^GGML_HEXAGON:BOOL=ON$" build-snapdragon/CMakeCache.txt
+              grep -q "^GGML_OPENCL:BOOL=OFF$" build-snapdragon/CMakeCache.txt
+              grep -q "^GGML_VULKAN:BOOL=OFF$" build-snapdragon/CMakeCache.txt
+              grep -q "^GGML_CPU_REPACK:BOOL=ON$" build-snapdragon/CMakeCache.txt
+
+              echo "=== Build ==="
+              cmake --build build-snapdragon --parallel 2
+
+              echo "=== Install ==="
+              cmake --install build-snapdragon \
+                --prefix pkg-snapdragon/llama.cpp
+
+              echo "=== Verify package ==="
+              test -f pkg-snapdragon/llama.cpp/bin/llama-cli
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-cpu.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-hexagon.so
+              test -f pkg-snapdragon/llama.cpp/lib/libggml-htp-v81.so
+
+              if find pkg-snapdragon/llama.cpp -name "libggml-opencl.so" -print -quit | grep -q .; then
+                echo "ERROR: OpenCL backend was unexpectedly built"
+                exit 1
+              fi
+
+              if find pkg-snapdragon/llama.cpp -name "libggml-vulkan.so" -print -quit | grep -q .; then
+                echo "ERROR: Vulkan backend was unexpectedly built"
+                exit 1
+              fi
+
+              mkdir -p pkg-snapdragon/llama.cpp/scripts
+              printf "%s\n" \
+                "#!/data/data/com.termux/files/usr/bin/bash" \
+                "set -e" \
+                "BASE=\"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)\"" \
+                "export LD_LIBRARY_PATH=\"/vendor/lib64:/vendor/lib:\$BASE/lib:\${LD_LIBRARY_PATH:-}\"" \
+                "export GGML_HEXAGON_ARCH=\"\${GGML_HEXAGON_ARCH:-81}\"" \
+                "export GGML_HEXAGON_NDEV=\"\${GGML_HEXAGON_NDEV:-1}\"" \
+                "exec \"\$BASE/bin/llama-cli\" \"\$@\"" \
+                > pkg-snapdragon/llama.cpp/scripts/run-termux.sh
+              chmod +x pkg-snapdragon/llama.cpp/scripts/run-termux.sh
+
+              echo "=== Installed files ==="
+              find pkg-snapdragon/llama.cpp -maxdepth 2 -type f | sort
+
+              echo "=== ELF dependencies ==="
+              readelf -d pkg-snapdragon/llama.cpp/bin/llama-cli | grep NEEDED || true
+            '
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          cd pkg-snapdragon
+          tar -czf ../llama.cpp-android-hexagon-uma-fit.tar.gz llama.cpp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama.cpp-android-hexagon-uma-fit
+          path: llama.cpp-android-hexagon-uma-fit.tar.gz
+          if-no-files-found: error
+          compression-level: 0
