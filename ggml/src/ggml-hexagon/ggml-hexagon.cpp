@@ -2858,7 +2858,34 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
     const struct ggml_tensor * src2 = op->src[2];
     const struct ggml_tensor * dst  = op;
 
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || src2->type != GGML_TYPE_I32) {
+    auto dbg_reject = [&](const char * why) {
+        const char * buft_name = "<no-buffer>";
+        if (src0 && src0->buffer) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src0->buffer);
+            if (buft) {
+                buft_name = ggml_backend_buft_name(buft);
+            }
+        }
+        GGML_LOG_INFO("DBG_MMID_REJECT: dev=%s why=%s src0=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] src1=%s ids=%s dst=%s buft=%s\n",
+            sess->c_name(), why,
+            src0 ? ggml_type_name(src0->type) : "<null>",
+            src0 ? src0->ne[0] : 0, src0 ? src0->ne[1] : 0, src0 ? src0->ne[2] : 0, src0 ? src0->ne[3] : 0,
+            src1 ? ggml_type_name(src1->type) : "<null>",
+            src2 ? ggml_type_name(src2->type) : "<null>",
+            dst  ? ggml_type_name(dst->type)  : "<null>",
+            buft_name);
+    };
+
+    if (src1->type != GGML_TYPE_F32) {
+        dbg_reject("src1-not-f32");
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32) {
+        dbg_reject("dst-not-f32");
+        return false;
+    }
+    if (src2->type != GGML_TYPE_I32) {
+        dbg_reject("ids-not-i32");
         return false;
     }
 
@@ -2869,25 +2896,42 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
             if ((src0->ne[0] % 32)) {
+                dbg_reject("src0-ne0-not-multiple-of-32");
                 return false;
             }
 
             // src0 (weights) must be repacked
             if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+                dbg_reject("weight-buffer-not-hexagon-repack");
                 return false;
             }
             break;
 
         default:
+            dbg_reject("unsupported-src0-type");
             return false;
     }
 
     struct htp_mm_kernel_params kparams;
     ggml_hexagon_precompute_matmul_params(sess, src0, src1, dst, &kparams);
     if ((size_t)kparams.vtcm_size > sess->vtcm_size) {
-        HEX_VERBOSE("ggml-hex: %s supported MUL_MAT_ID VTCM size needed (%d) > budget (%zu)\n", sess->c_name(), kparams.vtcm_size, sess->vtcm_size);
+        GGML_LOG_INFO("DBG_MMID_REJECT: dev=%s why=vtcm-too-large needed=%d budget=%zu src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+            sess->c_name(), kparams.vtcm_size, sess->vtcm_size,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
         return false;
     }
+
+    const char * buft_name = "<no-buffer>";
+    if (src0->buffer) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(src0->buffer);
+        if (buft) {
+            buft_name = ggml_backend_buft_name(buft);
+        }
+    }
+    GGML_LOG_INFO("DBG_MMID_ACCEPT: dev=%s src0=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] buft=%s vtcm=%d/%zu\n",
+        sess->c_name(), ggml_type_name(src0->type),
+        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+        buft_name, kparams.vtcm_size, sess->vtcm_size);
 
     return true;
 }
