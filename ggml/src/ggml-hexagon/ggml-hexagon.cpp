@@ -16,6 +16,8 @@
 #include <iomanip>
 #include <unordered_set>
 #include <unordered_map>
+#include <cerrno>
+#include <cstring>
 #include <regex>
 #include <queue>
 #include <algorithm>
@@ -326,7 +328,15 @@ struct ggml_hexagon_shared_buffer {
     void mmap() {
         fastrpc_map_flags flags = this->pinned ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
 
+        GGML_LOG_INFO("DBG_HEX_MAP_BEGIN: dev=%s domain=%d base=%p fd=%d size=%zu (%.2f MiB) flags=%d pinned=%d\n",
+                sess->c_name(), sess->domain_id, (void *) this->base, this->fd, this->size,
+                this->size / 1024.0 / 1024.0, (int) flags, (int) this->pinned);
+        errno = 0;
         int err = fastrpc_mmap(sess->domain_id, this->fd, (void *) this->base, 0, this->size, flags);
+        int saved_errno = errno;
+        GGML_LOG_INFO("DBG_HEX_MAP_RET: dev=%s err=0x%08x errno=%d (%s) base=%p fd=%d size=%.2f MiB\n",
+                sess->c_name(), (unsigned) err, saved_errno, std::strerror(saved_errno),
+                (void *) this->base, this->fd, this->size / 1024.0 / 1024.0);
         if (err != 0) {
             GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
                     sess->domain_id, this->size, this->fd, (unsigned) err);
@@ -359,13 +369,28 @@ struct ggml_hexagon_shared_buffer {
     void alloc(size_t size) {
         if (this->base) return;
 
+        GGML_LOG_INFO("DBG_HEX_RPCMEM_BEGIN: dev=%s size=%zu (%.2f MiB) heap=%d flags=0x%x\n",
+                sess->c_name(), size, size / 1024.0 / 1024.0,
+                RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS);
+        errno = 0;
         this->base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
+        int saved_errno_alloc = errno;
+        GGML_LOG_INFO("DBG_HEX_RPCMEM_RET: dev=%s base=%p errno=%d (%s) size=%.2f MiB\n",
+                sess->c_name(), (void *) this->base, saved_errno_alloc, std::strerror(saved_errno_alloc),
+                size / 1024.0 / 1024.0);
         if (!this->base) {
             GGML_LOG_ERROR("ggml-hex: %s failed to allocate buffer : size %zu\n", sess->c_name(), size);
             throw std::runtime_error("ggml-hex: rpcmem_alloc failed (see log for details)");
         }
 
+        GGML_LOG_INFO("DBG_HEX_FD_BEGIN: dev=%s base=%p size=%.2f MiB\n",
+                sess->c_name(), (void *) this->base, size / 1024.0 / 1024.0);
+        errno = 0;
         this->fd = rpcmem_to_fd(this->base);
+        int saved_errno_fd = errno;
+        GGML_LOG_INFO("DBG_HEX_FD_RET: dev=%s fd=%d errno=%d (%s) base=%p size=%.2f MiB\n",
+                sess->c_name(), this->fd, saved_errno_fd, std::strerror(saved_errno_fd),
+                (void *) this->base, size / 1024.0 / 1024.0);
         if (this->fd < 0) {
             GGML_LOG_ERROR("ggml-hex: %s failed to get FD for buffer %p\n", sess->c_name(), (void *) this->base);
             throw std::runtime_error("ggml-hex: rpcmem_to_fd failed (see log for details)");
@@ -1067,7 +1092,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_buffer_type_alloc_buffer(
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
     try {
         size += 4 * 1024;  // guard page
+        GGML_LOG_INFO("DBG_HEX_BUFT_ALLOC_BEGIN: kind=host dev=%s size=%zu (%.2f MiB)\n",
+                sess->c_name(), size, size / 1024.0 / 1024.0);
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
+        GGML_LOG_INFO("DBG_HEX_BUFT_ALLOC_OK: kind=host dev=%s base=%p fd=%d size=%.2f MiB mapped=%d\n",
+                sess->c_name(), (void *) sbuf->base, sbuf->fd, sbuf->size / 1024.0 / 1024.0, (int) sbuf->mapped);
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("ggml-hex: %s failed to allocate buffer context (host): %s\n", sess->c_name(), exc.what());
@@ -1080,7 +1109,11 @@ static ggml_backend_buffer_t ggml_backend_hexagon_repack_buffer_type_alloc_buffe
     auto sess = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type->context)->sess;
     try {
         size += 4 * 1024;  // guard page
+        GGML_LOG_INFO("DBG_HEX_BUFT_ALLOC_BEGIN: kind=repack dev=%s size=%zu (%.2f MiB)\n",
+                sess->c_name(), size, size / 1024.0 / 1024.0);
         ggml_hexagon_shared_buffer * sbuf = new ggml_hexagon_shared_buffer(sess, size);
+        GGML_LOG_INFO("DBG_HEX_BUFT_ALLOC_OK: kind=repack dev=%s base=%p fd=%d size=%.2f MiB mapped=%d\n",
+                sess->c_name(), (void *) sbuf->base, sbuf->fd, sbuf->size / 1024.0 / 1024.0, (int) sbuf->mapped);
         return ggml_backend_buffer_init(buffer_type, ggml_backend_hexagon_buffer_interface, sbuf, size);
     } catch (const std::exception & exc) {
         GGML_LOG_ERROR("ggml-hex: %s failed to allocate buffer context (repack): %s\n", sess->c_name(), exc.what());
