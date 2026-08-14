@@ -30,6 +30,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -37,6 +38,30 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+
+
+static void dbg_log_proc_mem(const char * stage, const char * buft) {
+#if defined(__linux__)
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    long vmrss=-1, rssanon=-1, rssfile=-1, vmswap=-1;
+    while (std::getline(f, line)) {
+        auto get = [&](const char * key, long & out) {
+            if (line.rfind(key, 0) == 0) {
+                std::istringstream iss(line.substr(std::strlen(key)));
+                iss >> out;
+            }
+        };
+        get("VmRSS:", vmrss); get("RssAnon:", rssanon);
+        get("RssFile:", rssfile); get("VmSwap:", vmswap);
+    }
+    LLAMA_LOG_INFO("DBG_MEM: stage=%s buft=%s VmRSS=%.2f MiB RssAnon=%.2f MiB RssFile=%.2f MiB VmSwap=%.2f MiB\\n",
+        stage, buft ? buft : "(null)", vmrss/1024.0, rssanon/1024.0, rssfile/1024.0, vmswap/1024.0);
+#else
+    (void) stage; (void) buft;
+#endif
+}
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
@@ -1630,6 +1655,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         ggml_backend_buft_name(buft), idx,
                         (last - first) / 1024.0 / 1024.0,
                         max_size / 1024.0 / 1024.0);
+                dbg_log_proc_mem("before_host_ptr_alloc", ggml_backend_buft_name(buft));
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1637,6 +1663,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_INFO("DBG_ALLOC_OK: buft=%s mode=host_ptr file=%u actual=%.2f MiB\n",
                         ggml_backend_buft_name(buft), idx,
                         ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+                dbg_log_proc_mem("after_host_ptr_alloc", ggml_backend_buft_name(buft));
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
@@ -1651,6 +1678,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             } else {
                 LLAMA_LOG_INFO("DBG_ALLOC_BEGIN: buft=%s mode=ctx tensor_bytes=%.2f MiB\n",
                         ggml_backend_buft_name(buft), dbg_ctx_bytes / 1024.0 / 1024.0);
+                dbg_log_proc_mem("before_ctx_alloc", ggml_backend_buft_name(buft));
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
             }
             if (buf == nullptr) {
@@ -1659,6 +1687,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_INFO("DBG_ALLOC_OK: buft=%s mode=%s actual=%.2f MiB\n",
                     ggml_backend_buft_name(buft), ml.no_alloc ? "dummy" : "ctx",
                     ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+            dbg_log_proc_mem(ml.no_alloc ? "after_dummy_alloc" : "after_ctx_alloc", ggml_backend_buft_name(buft));
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
