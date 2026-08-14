@@ -1599,6 +1599,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+
+        size_t dbg_ctx_bytes = 0;
+        size_t dbg_tensor_count = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            dbg_ctx_bytes += ggml_nbytes(t);
+            dbg_tensor_count++;
+        }
+        LLAMA_LOG_INFO("DBG_ALLOC_CTX: buft=%s tensors=%zu tensor_bytes=%.2f MiB no_alloc=%d mmap=%d host_ptr=%d default=%d\n",
+                ggml_backend_buft_name(buft), dbg_tensor_count,
+                dbg_ctx_bytes / 1024.0 / 1024.0,
+                (int) ml.no_alloc, (int) ml.use_mmap,
+                (int) buffer_from_host_ptr_supported, (int) is_default_buft);
+
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -1613,26 +1626,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+                LLAMA_LOG_INFO("DBG_ALLOC_BEGIN: buft=%s mode=host_ptr file=%u size=%.2f MiB max_tensor=%.2f MiB\n",
+                        ggml_backend_buft_name(buft), idx,
+                        (last - first) / 1024.0 / 1024.0,
+                        max_size / 1024.0 / 1024.0);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
+                LLAMA_LOG_INFO("DBG_ALLOC_OK: buft=%s mode=host_ptr file=%u actual=%.2f MiB\n",
+                        ggml_backend_buft_name(buft), idx,
+                        ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
         } else {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
+                LLAMA_LOG_INFO("DBG_ALLOC_BEGIN: buft=%s mode=dummy size=0 MiB\n", ggml_backend_buft_name(buft));
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                LLAMA_LOG_INFO("DBG_ALLOC_BEGIN: buft=%s mode=ctx tensor_bytes=%.2f MiB\n",
+                        ggml_backend_buft_name(buft), dbg_ctx_bytes / 1024.0 / 1024.0);
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
+            LLAMA_LOG_INFO("DBG_ALLOC_OK: buft=%s mode=%s actual=%.2f MiB\n",
+                    ggml_backend_buft_name(buft), ml.no_alloc ? "dummy" : "ctx",
+                    ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
