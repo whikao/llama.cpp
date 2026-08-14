@@ -966,11 +966,35 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
     switch (tensor->type) {
-        case GGML_TYPE_Q4_0:
-            GGML_ASSERT(offset == 0);
+        case GGML_TYPE_Q4_0: {
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-            repack_q4_0_tiled(tensor, data, size);
+
+            // v8 raw-Q4_0 staging path:
+            // Scheduler split copies land in the *default* HTP buffer in chunks, so
+            // offset can legitimately be non-zero.  The RAW_Q4_0 HTP kernel expects
+            // the original GGUF block_q4_0 byte layout, not the tiled REPACK layout.
+            //
+            // Keep the existing tiled conversion only for the explicit REPACK buffer.
+            // For the experimental raw-Q4_0 path on the normal HTP buffer, preserve
+            // bytes exactly and support partial set_tensor() writes.
+            const bool raw_q4_0_staging =
+                opt_mmid_raw_q4_0 &&
+                !ggml_backend_buffer_is_hexagon_repack(buffer);
+
+            if (raw_q4_0_staging) {
+                static bool logged_raw_set = false;
+                if (!logged_raw_set) {
+                    GGML_LOG_INFO("DBG_RAW_Q4_0_STAGE: raw set_tensor enabled dev=%s tensor=%s offset=%zu size=%zu nbytes=%zu\n",
+                        sess->c_name(), tensor->name, offset, size, ggml_nbytes(tensor));
+                    logged_raw_set = true;
+                }
+                memcpy((char *) tensor->data + offset, data, size);
+            } else {
+                GGML_ASSERT(offset == 0);
+                repack_q4_0_tiled(tensor, data, size);
+            }
             break;
+        }
 
         case GGML_TYPE_Q4_1:
             GGML_ASSERT(offset == 0);
@@ -1014,11 +1038,21 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
     switch (tensor->type) {
-        case GGML_TYPE_Q4_0:
-            GGML_ASSERT(offset == 0);
+        case GGML_TYPE_Q4_0: {
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-            repack_tiled_q4_0(data, tensor, size);
+
+            const bool raw_q4_0_staging =
+                opt_mmid_raw_q4_0 &&
+                !ggml_backend_buffer_is_hexagon_repack(buffer);
+
+            if (raw_q4_0_staging) {
+                memcpy(data, (const char *) tensor->data + offset, size);
+            } else {
+                GGML_ASSERT(offset == 0);
+                repack_tiled_q4_0(data, tensor, size);
+            }
             break;
+        }
 
         case GGML_TYPE_Q4_1:
             GGML_ASSERT(offset == 0);
