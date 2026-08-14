@@ -991,7 +991,12 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     }
 
     // add the device default buffer type
-    buft_list.emplace_back(dev, ggml_backend_dev_buffer_type(dev));
+    {
+        ggml_backend_buffer_type_t default_buft = ggml_backend_dev_buffer_type(dev);
+        LLAMA_LOG_INFO("DBG_BUFT: device=%s candidate[default]=%s\n",
+            ggml_backend_dev_name(dev), ggml_backend_buft_name(default_buft));
+        buft_list.emplace_back(dev, default_buft);
+    }
 
     // add the device extra buffer type (if any)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1002,6 +1007,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         if (ggml_backend_dev_get_extra_bufts_fn) {
             ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(dev);
             while (extra_bufts && *extra_bufts) {
+                LLAMA_LOG_INFO("DBG_BUFT: device=%s candidate[extra]=%s\n",
+                    ggml_backend_dev_name(dev), ggml_backend_buft_name(*extra_bufts));
                 buft_list.emplace_back(dev, *extra_bufts);
                 ++extra_bufts;
             }
