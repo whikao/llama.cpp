@@ -992,15 +992,17 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 }
                 memcpy((char *) tensor->data + offset, data, size);
 
-                // v10.1 selected-expert diagnostic.
-                // MUL_MAT_ID split copies are sparse: offset normally starts exactly at
-                // expert_id * nb[2], and size may contain one or more expert spans plus
-                // scheduler alignment bytes. Compare the first selected expert in this
-                // copy instead of waiting for the whole tensor to be copied.
-                if (tensor->ne[0] >= 32 && tensor->ne[1] >= 1 && tensor->nb[2] != 0 &&
-                    (offset % tensor->nb[2]) == 0 && size >= tensor->nb[2]) {
-                    static int dbg_v101_host_count = 0;
-                    if (dbg_v101_host_count < 16) {
+                // v10.2: fingerprint the first fully copied expert in this sparse
+                // scheduler write.  Unlike v10/v10.1 this is inserted directly
+                // into the known-good v8.1 branch and does not depend on a full
+                // 113 MiB tensor copy completing.
+                if (tensor->nb[2] != 0 &&
+                    offset % tensor->nb[2] == 0 &&
+                    size >= tensor->nb[2] &&
+                    tensor->ne[0] >= 32 &&
+                    tensor->ne[1] >= 1) {
+                    static int dbg_v102_host_count = 0;
+                    if (dbg_v102_host_count < 16) {
                         const size_t expert_id = offset / tensor->nb[2];
                         const uint8_t * expert_raw = (const uint8_t *) tensor->data + offset;
                         const block_q4_0 * src_matrix = (const block_q4_0 *) expert_raw;
@@ -1013,28 +1015,41 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
                         for (int row = 0; row < 32; ++row) {
                             if (row < valid_rows) {
-                                unpack_q4_0_quants(tile_quants[row], &src_matrix[row * blocks_per_row], 0);
+                                unpack_q4_0_quants(
+                                    tile_quants[row],
+                                    &src_matrix[row * blocks_per_row],
+                                    0);
                             } else {
                                 memset(tile_quants[row], 8, 32);
                             }
                         }
+
                         for (int cp = 0; cp < 16; ++cp) {
                             for (int row = 0; row < 32; ++row) {
                                 ref_tile[cp * 32 + row] =
-                                    (tile_quants[row][2 * cp + 1] << 4) | tile_quants[row][2 * cp];
+                                    (uint8_t) ((tile_quants[row][2 * cp + 1] << 4) |
+                                               tile_quants[row][2 * cp]);
                             }
                         }
-                        ggml_half * scale_dst = (ggml_half *) (ref_tile + 512);
+
+                        ggml_half * scale_dst =
+                            (ggml_half *) (ref_tile + 512);
                         for (int row = 0; row < 32; ++row) {
-                            scale_dst[row] = row < valid_rows ? src_matrix[row * blocks_per_row].d : 0;
+                            scale_dst[row] =
+                                row < valid_rows
+                                    ? src_matrix[row * blocks_per_row].d
+                                    : (ggml_half) 0;
                         }
 
-                        const size_t raw_cmp = (size_t) valid_rows * tensor->nb[1];
+                        const size_t raw_bytes =
+                            (size_t) valid_rows * tensor->nb[1];
+
                         uint32_t raw_fnv = 2166136261u;
-                        for (size_t i = 0; i < raw_cmp; ++i) {
+                        for (size_t i = 0; i < raw_bytes; ++i) {
                             raw_fnv ^= expert_raw[i];
                             raw_fnv *= 16777619u;
                         }
+
                         uint32_t tile_fnv = 2166136261u;
                         for (size_t i = 0; i < sizeof(ref_tile); ++i) {
                             tile_fnv ^= ref_tile[i];
@@ -1042,45 +1057,24 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                         }
 
                         GGML_LOG_INFO(
-                            "DBG_V101_HOST: dev=%s tensor=%s expert=%zu copy_off=%zu copy_size=%zu nb01=%zu nb02=%zu raw_bytes=%zu raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x\n",
-                            sess->c_name(), tensor->name, expert_id, offset, size,
-                            tensor->nb[1], tensor->nb[2], raw_cmp, raw_fnv, tile_fnv,
+                            "DBG_V102_HOST: dev=%s tensor=%s expert=%zu copy_off=%zu copy_size=%zu "
+                            "nb01=%zu nb02=%zu raw_bytes=%zu raw_fnv=%08x tile_fnv=%08x "
+                            "first=%02x%02x%02x%02x scale=%02x%02x\\n",
+                            sess->c_name(),
+                            tensor->name,
+                            expert_id,
+                            offset,
+                            size,
+                            tensor->nb[1],
+                            tensor->nb[2],
+                            raw_bytes,
+                            raw_fnv,
+                            tile_fnv,
                             ref_tile[0], ref_tile[1], ref_tile[2], ref_tile[3],
                             ref_tile[512], ref_tile[513]);
-                        ++dbg_v101_host_count;
-                    }
-                }
-            } else {
-                            memset(tile_quants[row], 8, 32);
-                        }
-                    }
-                    for (int cp = 0; cp < 16; ++cp) {
-                        for (int row = 0; row < 32; ++row) {
-                            ref_tile[cp * 32 + row] =
-                                (tile_quants[row][2 * cp + 1] << 4) | tile_quants[row][2 * cp];
-                        }
-                    }
-                    ggml_half * scale_dst = (ggml_half *) (ref_tile + 512);
-                    for (int row = 0; row < 32; ++row) {
-                        scale_dst[row] = row < valid_rows ? src_matrix[row * blocks_per_row].d : 0;
-                    }
 
-                    uint32_t fnv = 2166136261u;
-                    for (size_t i = 0; i < sizeof(ref_tile); ++i) {
-                        fnv ^= ref_tile[i];
-                        fnv *= 16777619u;
+                        ++dbg_v102_host_count;
                     }
-                    uint32_t raw_fnv = 2166136261u;
-                    const size_t raw_cmp = std::min<size_t>((size_t) tensor->nb[1] * valid_rows, 32u * (size_t) tensor->nb[1]);
-                    for (size_t i = 0; i < raw_cmp; ++i) {
-                        raw_fnv ^= ((const uint8_t *) tensor->data)[i];
-                        raw_fnv *= 16777619u;
-                    }
-                    GGML_LOG_INFO("DBG_V10_HOST: tensor=%s ne0=%lld ne1=%lld ne2=%lld nb01=%zu nb02=%zu raw_bytes=%zu raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x\n",
-                        tensor->name,
-                        (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2],
-                        tensor->nb[1], tensor->nb[2], raw_cmp, raw_fnv, fnv,
-                        ref_tile[0], ref_tile[1], ref_tile[2], ref_tile[3], ref_tile[512], ref_tile[513]);
                 }
             } else {
                 GGML_ASSERT(offset == 0);
