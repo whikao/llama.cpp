@@ -1015,16 +1015,34 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
                         const bool supports = ggml_backend_supports_op(sched->backends[b], tensor);
-                        const bool wants_offload = supports ? ggml_backend_offload_op(sched->backends[b], tensor) : false;
+                        const bool backend_wants_offload = supports ? ggml_backend_offload_op(sched->backends[b], tensor) : false;
+
+                        // v7 experimental policy:
+                        // For the raw-Q4_0 MUL_MAT_ID PoC only, force the scheduler to choose
+                        // the first higher-priority HTP backend that already reported supports_op=true.
+                        //
+                        // This intentionally bypasses ggml_backend_offload_op()==false, which v6
+                        // proved is the remaining reason these nodes stay on CPU with cause=1.wgt0.
+                        // Pass 5 will then create/reuse a temporary copy of the CPU_Mapped weight
+                        // in the selected HTP default buffer instead of moving the model's permanent
+                        // storage away from mmap.
+                        const bool force_raw_q4_0_offload = dbg_raw_mmid && supports;
+                        const bool wants_offload = backend_wants_offload || force_raw_q4_0_offload;
+
                         if (dbg_raw_mmid) {
-                            GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 candidate=%s(%d) supports=%d offload_op=%d\n",
-                                ggml_backend_name(sched->backends[b]), b, supports ? 1 : 0, wants_offload ? 1 : 0);
+                            GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 candidate=%s(%d) supports=%d offload_op=%d force_raw=%d\n",
+                                ggml_backend_name(sched->backends[b]), b,
+                                supports ? 1 : 0,
+                                backend_wants_offload ? 1 : 0,
+                                force_raw_q4_0_offload ? 1 : 0);
                         }
+
                         if (supports && wants_offload) {
-                            SET_CAUSE(tensor, "1.off");
+                            SET_CAUSE(tensor, force_raw_q4_0_offload ? "1.raw" : "1.off");
                             if (dbg_raw_mmid) {
-                                GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 choose=%s(%d) cause=1.off\n",
-                                    ggml_backend_name(sched->backends[b]), b);
+                                GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 choose=%s(%d) cause=%s\n",
+                                    ggml_backend_name(sched->backends[b]), b,
+                                    force_raw_q4_0_offload ? "1.raw" : "1.off");
                             }
                             return b;
                         }
