@@ -71,6 +71,7 @@ static int    opt_etm     = 0;
 static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
+static int    opt_mmid_raw_q4_0 = 0; // EXPERIMENTAL: keep Q4_0 MUL_MAT_ID weights on host; scheduler stages raw copies
 
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -2376,7 +2377,14 @@ static void ggml_hexagon_precompute_hvx_mm_params(
         const bool k_align = (ne10 % 32 == 0);
 
         if (is_matmul_id) {
-            kparams->kernel_type   = (src1_nrows < (int) sess->n_threads) ? HTP_MM_KERNEL_HVX_QUANT_BLOCK : HTP_MM_KERNEL_HVX_QUANT_ROW;
+            const bool raw_q4_0_mmid =
+                opt_mmid_raw_q4_0 &&
+                wtype == GGML_TYPE_Q4_0 &&
+                (!src0->buffer || !ggml_backend_buffer_is_hexagon_repack(src0->buffer));
+
+            kparams->kernel_type = raw_q4_0_mmid
+                ? HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0
+                : ((src1_nrows < (int) sess->n_threads) ? HTP_MM_KERNEL_HVX_QUANT_BLOCK : HTP_MM_KERNEL_HVX_QUANT_ROW);
             kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
 
             struct htp_mm_hvx_vtcm_layout L;
@@ -2924,6 +2932,39 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
+            if ((src0->ne[0] % 32)) {
+                dbg_reject("src0-ne0-not-multiple-of-32");
+                return false;
+            }
+
+            if (opt_mmid_raw_q4_0) {
+                // PoC policy:
+                //   * during model placement, reject HTP-REPACK and HTP default buffers so the
+                //     expert tensor remains in a host/CPU buffer;
+                //   * let the scheduler stage a temporary raw Q4_0 copy for HTP execution.
+                //
+                // The HTP op receives that staged raw copy and converts one 32-row chunk at a time
+                // to the existing tiled format in VTCM.
+                if (src0->buffer) {
+                    if (ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+                        dbg_reject("raw-q4_0-poc-reject-repack-storage");
+                        return false;
+                    }
+                    if (!ggml_backend_buffer_is_host(src0->buffer)) {
+                        dbg_reject("raw-q4_0-poc-model-storage-must-be-host");
+                        return false;
+                    }
+                }
+                break;
+            }
+
+            // normal upstream path: src0 (weights) must be repacked
+            if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
+                dbg_reject("weight-buffer-not-hexagon-repack");
+                return false;
+            }
+            break;
+
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
@@ -2932,8 +2973,6 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
                 dbg_reject("src0-ne0-not-multiple-of-32");
                 return false;
             }
-
-            // src0 (weights) must be repacked
             if (src0->buffer && !ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
                 dbg_reject("weight-buffer-not-hexagon-repack");
                 return false;
@@ -4479,6 +4518,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_vmem     = getenv("GGML_HEXAGON_VMEM");
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
+    const char * str_mmid_raw_q4_0 = getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -4512,6 +4552,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_opfilter  = str_opfilter ? new std::regex(str_opfilter, RE_ICASE) : NULL;
     opt_verbose   = str_verbose  ? atoi(str_verbose)                      : 0;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
+    opt_mmid_raw_q4_0 = str_mmid_raw_q4_0 ? atoi(str_mmid_raw_q4_0) : opt_mmid_raw_q4_0;
     opt_opstage   = str_opstage  ? strtoul(str_opstage, NULL, 0)          : opt_opstage;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
@@ -4526,6 +4567,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_ndev      = str_ndev     ? strtoul(str_ndev, NULL, 0)             : opt_ndev;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
+    opt_mmid_raw_q4_0 = str_mmid_raw_q4_0 ? atoi(str_mmid_raw_q4_0) : opt_mmid_raw_q4_0;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
 
