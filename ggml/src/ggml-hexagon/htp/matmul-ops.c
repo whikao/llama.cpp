@@ -1164,26 +1164,8 @@ static void htp_raw_q4_0_32rows_to_tiled(
         uint32_t valid_rows) {
     const uint32_t n_k_tiles = k / 32;
 
-    static int logged_v9_layout = 0;
-    if (!logged_v9_layout) {
-        FARF(ALWAYS, "DBG_RAW_Q4_0_V9_LAYOUT: payload=%u aligned=%u n_k_tiles=%u",
-             (unsigned) HTP_MM_WEIGHT_TILE_SIZE_Q4_0,
-             (unsigned) HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0,
-             (unsigned) n_k_tiles);
-        logged_v9_layout = 1;
-    }
-
     for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
-        // The existing HTP tiled kernels consume weights from VTCM using the
-        // aligned per-K-tile stride (640 bytes for Q4_0), even though the
-        // payload itself is only 576 bytes.  The raw->tiled converter used to
-        // pack tiles back-to-back at 576-byte stride, which made kt >= 1 read
-        // the wrong bytes.
-        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
-
-        // Keep the alignment tail deterministic. The dot kernel should ignore
-        // it, but zeroing makes diagnostics/reproducibility cleaner.
-        memset(tile, 0, HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0);
+        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
 
         for (uint32_t cp = 0; cp < 16; ++cp) {
             for (uint32_t row = 0; row < 32; ++row) {
@@ -1263,6 +1245,28 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
             // Convert only this working set; no model-sized REPACK allocation.
             htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+
+            static int dbg_v10_once = 0;
+            if (!dbg_v10_once) {
+                uint32_t raw_fnv = 2166136261u;
+                const size_t raw_cmp = (size_t) valid_rows * raw_row_size;
+                for (size_t di = 0; di < raw_cmp; ++di) {
+                    raw_fnv ^= raw_buf[di];
+                    raw_fnv *= 16777619u;
+                }
+                uint32_t tile_fnv = 2166136261u;
+                for (size_t di = 0; di < HTP_MM_WEIGHT_TILE_SIZE_Q4_0; ++di) {
+                    tile_fnv ^= tiled_buf[di];
+                    tile_fnv *= 16777619u;
+                }
+                FARF(ALWAYS,
+                     "DBG_V10_DSP: mode=mmid cur_a=%u ct=%u ne00=%u ne01=%u ne02=%u nb01=%u nb02=%u valid=%u raw_bytes=%u raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x",
+                     (unsigned) cur_a, (unsigned) ct, (unsigned) ne00, (unsigned) ne01, (unsigned) ne02,
+                     (unsigned) nb01, (unsigned) nb02, (unsigned) valid_rows, (unsigned) raw_cmp,
+                     (unsigned) raw_fnv, (unsigned) tile_fnv,
+                     tiled_buf[0], tiled_buf[1], tiled_buf[2], tiled_buf[3], tiled_buf[512], tiled_buf[513]);
+                dbg_v10_once = 1;
+            }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
             for (uint32_t cid = 0; cid < (uint32_t)cne1; ++cid) {
