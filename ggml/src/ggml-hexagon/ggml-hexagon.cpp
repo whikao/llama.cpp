@@ -4093,13 +4093,51 @@ static bool ggml_hexagon_supported_buffer(ggml_hexagon_session *sess, const stru
 }
 
 static bool ggml_hexagon_supported_buffers(ggml_hexagon_session *sess, const struct ggml_tensor * t) {
-    // all srcs & dsts must be mapped to the same session
+    // Experimental exception for raw Q4_0 MUL_MAT_ID:
+    //
+    // Model storage must stay on the ordinary CPU/CPU_Mapped buffer, but the Hexagon
+    // device support probe normally rejects *any* op whose src0 is not already backed
+    // by the same Hexagon session.  That outer rejection happens before
+    // ggml_hexagon_supported_mul_mat_id(), so the raw-Q4_0 path never gets a chance
+    // to advertise support.
+    //
+    // For this one PoC case only, allow src0 to be a non-Hexagon host buffer.  All
+    // other operands/dst still obey the normal same-session rule.  This does not
+    // change normal MUL_MAT_ID or any other op.
+    const struct ggml_tensor * raw_src0 =
+        (t && t->op == GGML_OP_MUL_MAT_ID) ? t->src[0] : nullptr;
+
+    const bool raw_q4_0_mmid_host_src =
+        opt_mmid_raw_q4_0 &&
+        raw_src0 &&
+        raw_src0->type == GGML_TYPE_Q4_0 &&
+        raw_src0->buffer &&
+        !ggml_backend_buffer_is_hexagon(raw_src0->buffer) &&
+        ggml_backend_buffer_is_host(raw_src0->buffer);
+
+    // dst must still be mapped to this HTP session (or be unallocated during probing).
     if (!ggml_hexagon_supported_buffer(sess, t)) {
         return false;
     }
 
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (!ggml_hexagon_supported_buffer(sess, t->src[i])) {
+        const struct ggml_tensor * src = t->src[i];
+
+        if (i == 0 && raw_q4_0_mmid_host_src) {
+            // CPU / CPU_Mapped raw GGUF Q4_0 source is intentionally allowed here.
+            // ggml_hexagon_supported_mul_mat_id() will perform the remaining type,
+            // shape and VTCM checks.
+            static bool logged_once = false;
+            if (!logged_once) {
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(raw_src0->buffer);
+                GGML_LOG_INFO("DBG_RAW_Q4_0: allowing host src0 through outer buffer gate dev=%s buft=%s\n",
+                    sess->c_name(), buft ? ggml_backend_buft_name(buft) : "<null>");
+                logged_once = true;
+            }
+            continue;
+        }
+
+        if (!ggml_hexagon_supported_buffer(sess, src)) {
             return false;
         }
     }
