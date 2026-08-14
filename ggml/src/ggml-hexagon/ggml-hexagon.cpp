@@ -991,6 +991,53 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     logged_raw_set = true;
                 }
                 memcpy((char *) tensor->data + offset, data, size);
+
+                // v10 correctness diagnostic. Once the final byte range has arrived,
+                // construct tile (ct=0, kt=0) exactly like official repack_q4_0_tiled()
+                // and print a compact byte-for-byte fingerprint for comparison with DSP.
+                if (offset + size == ggml_nbytes(tensor) && tensor->ne[0] >= 32 && tensor->ne[1] >= 1) {
+                    uint8_t ref_tile[HTP_MM_WEIGHT_TILE_SIZE_Q4_0];
+                    memset(ref_tile, 0, sizeof(ref_tile));
+                    uint8_t tile_quants[32][32];
+                    const block_q4_0 * src_matrix = (const block_q4_0 *) tensor->data;
+                    const int64_t blocks_per_row = tensor->ne[0] / 32;
+                    const int valid_rows = (int) std::min<int64_t>(tensor->ne[1], 32);
+
+                    for (int row = 0; row < 32; ++row) {
+                        if (row < valid_rows) {
+                            unpack_q4_0_quants(tile_quants[row], &src_matrix[row * blocks_per_row], 0);
+                        } else {
+                            memset(tile_quants[row], 8, 32);
+                        }
+                    }
+                    for (int cp = 0; cp < 16; ++cp) {
+                        for (int row = 0; row < 32; ++row) {
+                            ref_tile[cp * 32 + row] =
+                                (tile_quants[row][2 * cp + 1] << 4) | tile_quants[row][2 * cp];
+                        }
+                    }
+                    ggml_half * scale_dst = (ggml_half *) (ref_tile + 512);
+                    for (int row = 0; row < 32; ++row) {
+                        scale_dst[row] = row < valid_rows ? src_matrix[row * blocks_per_row].d : 0;
+                    }
+
+                    uint32_t fnv = 2166136261u;
+                    for (size_t i = 0; i < sizeof(ref_tile); ++i) {
+                        fnv ^= ref_tile[i];
+                        fnv *= 16777619u;
+                    }
+                    uint32_t raw_fnv = 2166136261u;
+                    const size_t raw_cmp = std::min<size_t>((size_t) tensor->nb[1] * valid_rows, 32u * (size_t) tensor->nb[1]);
+                    for (size_t i = 0; i < raw_cmp; ++i) {
+                        raw_fnv ^= ((const uint8_t *) tensor->data)[i];
+                        raw_fnv *= 16777619u;
+                    }
+                    GGML_LOG_INFO("DBG_V10_HOST: tensor=%s ne0=%lld ne1=%lld ne2=%lld nb01=%zu nb02=%zu raw_bytes=%zu raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x\n",
+                        tensor->name,
+                        (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2],
+                        tensor->nb[1], tensor->nb[2], raw_cmp, raw_fnv, fnv,
+                        ref_tile[0], ref_tile[1], ref_tile[2], ref_tile[3], ref_tile[512], ref_tile[513]);
+                }
             } else {
                 GGML_ASSERT(offset == 0);
                 repack_q4_0_tiled(tensor, data, size);
