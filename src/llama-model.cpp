@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -968,8 +969,23 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
         auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
             ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
         if (ggml_backend_dev_get_extra_bufts_fn) {
+            const char * raw_q4_0_env = std::getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
+            const bool raw_q4_0_mmid_poc = raw_q4_0_env && std::atoi(raw_q4_0_env) != 0;
+
             ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(cpu_dev);
             while (extra_bufts && *extra_bufts) {
+                const char * extra_name = ggml_backend_buft_name(*extra_bufts);
+
+                // Experimental Hexagon MMID raw-Q4_0 path:
+                // CPU_REPACK changes the on-memory Q4_0 layout (q4_0_4x8 etc.).
+                // The HTP-side PoC expects the original GGUF block_q4_0 bytes, so
+                // keep model weights on the ordinary CPU/mmap buffer instead.
+                if (raw_q4_0_mmid_poc && extra_name && std::strcmp(extra_name, "CPU_REPACK") == 0) {
+                    LLAMA_LOG_INFO("DBG_RAW_Q4_0: skipping CPU_REPACK model-storage candidate\n");
+                    ++extra_bufts;
+                    continue;
+                }
+
                 buft_list.emplace_back(cpu_dev, *extra_bufts);
                 ++extra_bufts;
             }
