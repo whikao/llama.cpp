@@ -1246,8 +1246,11 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             // Convert only this working set; no model-sized REPACK allocation.
             htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
 
-            static int dbg_v10_once = 0;
-            if (!dbg_v10_once) {
+            // v10.1: log the actual selected expert address/content used by DSP.
+            // cur_a is the expert index for MUL_MAT_ID; cne1 != 0 means this expert
+            // was selected by at least one routed row.
+            static int dbg_v101_dsp_count = 0;
+            if (dbg_v101_dsp_count < 16 && ct == ct_start) {
                 uint32_t raw_fnv = 2166136261u;
                 const size_t raw_cmp = (size_t) valid_rows * raw_row_size;
                 for (size_t di = 0; di < raw_cmp; ++di) {
@@ -1260,12 +1263,14 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     tile_fnv *= 16777619u;
                 }
                 FARF(ALWAYS,
-                     "DBG_V10_DSP: mode=mmid cur_a=%u ct=%u ne00=%u ne01=%u ne02=%u nb01=%u nb02=%u valid=%u raw_bytes=%u raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x",
-                     (unsigned) cur_a, (unsigned) ct, (unsigned) ne00, (unsigned) ne01, (unsigned) ne02,
-                     (unsigned) nb01, (unsigned) nb02, (unsigned) valid_rows, (unsigned) raw_cmp,
+                     "DBG_V101_DSP: expert=%u cne1=%d src_off=%u ct=%u ne00=%u ne01=%u ne02=%u nb01=%u nb02=%u raw_bytes=%u raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x",
+                     (unsigned) cur_a, (int) cne1, (unsigned) (cur_a * nb02),
+                     (unsigned) ct, (unsigned) ne00, (unsigned) ne01, (unsigned) ne02,
+                     (unsigned) nb01, (unsigned) nb02, (unsigned) raw_cmp,
                      (unsigned) raw_fnv, (unsigned) tile_fnv,
-                     tiled_buf[0], tiled_buf[1], tiled_buf[2], tiled_buf[3], tiled_buf[512], tiled_buf[513]);
-                dbg_v10_once = 1;
+                     tiled_buf[0], tiled_buf[1], tiled_buf[2], tiled_buf[3],
+                     tiled_buf[512], tiled_buf[513]);
+                ++dbg_v101_dsp_count;
             }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
