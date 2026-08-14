@@ -1164,8 +1164,26 @@ static void htp_raw_q4_0_32rows_to_tiled(
         uint32_t valid_rows) {
     const uint32_t n_k_tiles = k / 32;
 
+    static int logged_v9_layout = 0;
+    if (!logged_v9_layout) {
+        FARF(ALWAYS, "DBG_RAW_Q4_0_V9_LAYOUT: payload=%u aligned=%u n_k_tiles=%u",
+             (unsigned) HTP_MM_WEIGHT_TILE_SIZE_Q4_0,
+             (unsigned) HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0,
+             (unsigned) n_k_tiles);
+        logged_v9_layout = 1;
+    }
+
     for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
-        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
+        // The existing HTP tiled kernels consume weights from VTCM using the
+        // aligned per-K-tile stride (640 bytes for Q4_0), even though the
+        // payload itself is only 576 bytes.  The raw->tiled converter used to
+        // pack tiles back-to-back at 576-byte stride, which made kt >= 1 read
+        // the wrong bytes.
+        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
+
+        // Keep the alignment tail deterministic. The dot kernel should ignore
+        // it, but zeroing makes diagnostics/reproducibility cleaner.
+        memset(tile, 0, HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0);
 
         for (uint32_t cp = 0; cp < 16; ++cp) {
             for (uint32_t row = 0; row < 32; ++row) {
