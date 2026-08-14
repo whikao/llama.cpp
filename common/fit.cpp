@@ -329,51 +329,21 @@ static void common_params_fit_impl(
             LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
         }
 
-        // Keep layer distribution balanced across the logical HTP devices and
-        // search from maximum offload downward.  We evaluate the real aggregate
-        // UMA footprint for every candidate, so CPU_REPACK growth is included
-        // and no monotonic-memory assumption is required.
-        std::vector<float> test_split(nd, 1.0f);
-        int best_ngl = -1;
-        int64_t best_used = 0;
-
-        for (int ngl = int(hp_ngl) + 1; ngl >= 0; --ngl) {
-            llama_model_params mparams_test = *mparams;
-            mparams_test.n_gpu_layers = ngl;
-            mparams_test.tensor_split = nd > 1 ? test_split.data() : nullptr;
-            mparams_test.tensor_buft_overrides = nullptr;
-
-            const dmds_t dmds_test = common_get_device_memory_data_impl(
-                path_model, &mparams_test, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-            const int64_t used = shared_used(dmds_test);
-
-            LOG_TRC("%s: UMA test n_gpu_layers=%d -> shared use %" PRId64 " MiB vs target %" PRId64 " MiB\n",
-                    __func__, ngl, used/MiB, shared_target/MiB);
-
-            if (used <= shared_target) {
-                best_ngl = ngl;
-                best_used = used;
-                break;
-            }
-        }
-
-        if (best_ngl < 0) {
-            throw common_params_fit_exception(
-                "unable to fit model into the shared UMA memory pool (including CPU_REPACK and host buffers)");
-        }
-
-        mparams->n_gpu_layers = best_ngl;
-        if (nd > 1) {
-            for (size_t id = 0; id < nd; ++id) {
-                tensor_split[id] = 1.0f;
-            }
-            mparams->tensor_split = tensor_split;
-        }
-        tensor_buft_overrides[0] = {nullptr, nullptr};
-        mparams->tensor_buft_overrides = tensor_buft_overrides;
-
-        LOG_TRC("%s: UMA group fit selected n_gpu_layers=%d, shared use %" PRId64 " MiB, leaving %" PRId64 " MiB\n",
-                __func__, best_ngl, best_used/MiB, (shared_free - best_used)/MiB);
+        // HTP/Hexagon UMA special case:
+        // Reducing n_gpu_layers does not meaningfully reduce the physical shared-RAM
+        // footprint for repacked MoE models.  It mainly moves weights from HTP*-REPACK
+        // into CPU_REPACK, which can dramatically increase host-side allocation pressure.
+        // auto75 showed this directly: the aggregate stayed ~16.6 GiB while CPU_REPACK
+        // grew from a small fraction to ~15.6 GiB as n_gpu_layers approached zero.
+        //
+        // Therefore --fit must NOT walk n_gpu_layers downward for a pure UMA HTP group.
+        // Keep the caller's maximum/offload placement unchanged and let the backend/session
+        // allocation rules decide whether the selected HTP configuration is viable.
+        LOG_WRN("%s: UMA HTP group exceeds the conservative shared-memory target (%" PRId64
+                " MiB used vs %" PRId64 " MiB target), but reducing n_gpu_layers would move "
+                "HTP_REPACK weights into CPU_REPACK without materially reducing shared RAM; "
+                "keeping maximum HTP offload unchanged\n",
+                __func__, initial_used/MiB, shared_target/MiB);
         return;
     }
 
