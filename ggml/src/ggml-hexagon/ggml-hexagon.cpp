@@ -61,6 +61,8 @@ using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
 using u32vec  = std::vector<uint32_t>;
 
+static inline bool ggml_backend_buffer_is_hexagon_repack(const struct ggml_backend_buffer * b);
+
 static int    opt_arch    = 0; // autodetect
 static size_t opt_ndev    = 1;
 static size_t opt_nhvx    = 0; // use all
