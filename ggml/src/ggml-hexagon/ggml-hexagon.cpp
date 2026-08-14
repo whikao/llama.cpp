@@ -2946,12 +2946,28 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
                 // The HTP op receives that staged raw copy and converts one 32-row chunk at a time
                 // to the existing tiled format in VTCM.
                 if (src0->buffer) {
-                    if (ggml_backend_buffer_is_hexagon_repack(src0->buffer)) {
-                        dbg_reject("raw-q4_0-poc-reject-repack-storage");
+                    // Important: the normal HTP buffer reports itself as host-capable too.
+                    // Reject *all* Hexagon-backed storage here, otherwise model loading will
+                    // place the whole Q4_0 expert tensor set into HTP0 rpcmem (auto89 showed
+                    // ~14.95 GiB), which defeats the small-staging design.
+                    if (ggml_backend_buffer_is_hexagon(src0->buffer)) {
+                        dbg_reject("raw-q4_0-poc-reject-hexagon-model-storage");
                         return false;
                     }
+
+                    ggml_backend_buffer_type_t src0_buft = ggml_backend_buffer_get_type(src0->buffer);
+                    const char * src0_buft_name = src0_buft ? ggml_backend_buft_name(src0_buft) : "";
+                    if (strcmp(src0_buft_name, "CPU_REPACK") == 0) {
+                        // CPU_REPACK is not raw GGUF block_q4_0 layout either.
+                        dbg_reject("raw-q4_0-poc-reject-cpu-repack-storage");
+                        return false;
+                    }
+
+                    // Accept raw CPU/CPU_Mapped host storage. The scheduler may later stage a
+                    // temporary copy into the HTP default buffer; kernel selection is computed
+                    // from the raw-Q4_0 experiment flag and the non-REPACK layout.
                     if (!ggml_backend_buffer_is_host(src0->buffer)) {
-                        dbg_reject("raw-q4_0-poc-model-storage-must-be-host");
+                        dbg_reject("raw-q4_0-poc-model-storage-must-be-raw-host");
                         return false;
                     }
                 }
