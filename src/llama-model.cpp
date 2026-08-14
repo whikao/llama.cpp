@@ -1325,12 +1325,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.use_mmap = false;
-                break;
+        const char * raw_q4_0_env = std::getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
+        const bool raw_q4_0_mmid_poc = raw_q4_0_env && std::atoi(raw_q4_0_env) != 0;
+
+        if (raw_q4_0_mmid_poc) {
+            // v4 PoC:
+            // Keep mmap enabled even though Hexagon itself does not advertise mmap_support.
+            // HTP/HTP-REPACK contexts still use their normal backend allocations; only tensors
+            // that fell back to the ordinary CPU buffer are backed directly by GGUF mmap pages.
+            //
+            // This is required for the raw Q4_0 MUL_MAT_ID experiment: the expert weights must
+            // stay in their original GGUF block_q4_0 layout without creating a ~15 GiB CPU copy.
+            LLAMA_LOG_INFO("DBG_RAW_Q4_0: keeping mmap enabled in AUTO mode for CPU fallback tensors\n");
+        } else {
+            for (const auto & dev : devices) {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev.dev, &props);
+                if (!props.caps.mmap_support) {
+                    ml.use_mmap = false;
+                    break;
+                }
             }
         }
     }
