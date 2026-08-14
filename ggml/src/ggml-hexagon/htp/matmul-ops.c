@@ -1145,6 +1145,185 @@ static void hvx_mv_2d(unsigned int nth, unsigned int ith, void * data) {
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id) * mmctx->mapping_stride + (i1)]
 
+// EXPERIMENTAL: convert 32 raw GGUF Q4_0 rows into the existing HTP tiled Q4_0
+// layout entirely in VTCM. This is a pure byte-layout transform; scales are copied bitwise.
+#define HTP_RAW_Q4_0_BLOCK_BYTES 18u
+
+static inline uint8_t htp_raw_q4_0_get_nibble(const uint8_t * qs, uint32_t q) {
+    if (q < 16) {
+        return qs[q] & 0x0f;
+    }
+    return qs[q - 16] >> 4;
+}
+
+static void htp_raw_q4_0_32rows_to_tiled(
+        const uint8_t * restrict raw,
+        size_t raw_row_size,
+        uint8_t * restrict tiled,
+        uint32_t k,
+        uint32_t valid_rows) {
+    const uint32_t n_k_tiles = k / 32;
+
+    for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
+        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
+
+        for (uint32_t cp = 0; cp < 16; ++cp) {
+            for (uint32_t row = 0; row < 32; ++row) {
+                uint8_t packed = 0x88; // zero in q4_0's biased nibble representation
+                if (row < valid_rows) {
+                    const uint8_t * block = raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
+                    const uint8_t * qs = block + 2; // fp16 scale occupies first 2 bytes
+                    const uint8_t q0 = htp_raw_q4_0_get_nibble(qs, 2 * cp + 0);
+                    const uint8_t q1 = htp_raw_q4_0_get_nibble(qs, 2 * cp + 1);
+                    packed = (uint8_t) (q0 | (q1 << 4));
+                }
+                tile[cp * 32 + row] = packed;
+            }
+        }
+
+        uint8_t * scale_dst = tile + 512;
+        for (uint32_t row = 0; row < 32; ++row) {
+            if (row < valid_rows) {
+                const uint8_t * block = raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
+                scale_dst[2 * row + 0] = block[0];
+                scale_dst[2 * row + 1] = block[1];
+            } else {
+                scale_dst[2 * row + 0] = 0;
+                scale_dst[2 * row + 1] = 0;
+            }
+        }
+    }
+}
+
+static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+
+    const struct htp_tensor * restrict ids = octx->src[2];
+    const uint32_t src0_nrows      = ne01;
+    const uint32_t src1_nrows      = ne11;
+    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+
+    hvx_mm_run_quant_task(mmctx, ith);
+    if (src0_start_row >= src0_end_row) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    const uint32_t n_as = ne02;
+    const uint32_t * matrix_row_counts = mmctx->matrix_row_counts;
+    const struct mmid_row_mapping * matrix_rows = mmctx->matrix_rows;
+
+    const size_t src1_stride = mmctx->vtcm_src1_stride;
+    uint8_t * restrict thread_vtcm = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
+    const size_t raw_row_size = nb01;
+    const size_t raw_32_size = htp_mm_round_up(32 * raw_row_size, 256);
+    uint8_t * restrict raw_buf = thread_vtcm;
+    uint8_t * restrict tiled_buf = thread_vtcm + raw_32_size;
+    uint8_t * restrict src1_data = mmctx->vtcm_src1;
+
+    for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
+        const int32_t cne1 = matrix_row_counts[cur_a];
+        if (cne1 == 0) {
+            continue;
+        }
+
+        const uint8_t * src0_expert = (const uint8_t *) src0->data + cur_a * nb02;
+        const uint32_t ct_start = src0_start_row / 32;
+        const uint32_t ct_end   = (src0_end_row + 31) / 32;
+
+        for (uint32_t ct = ct_start; ct < ct_end; ++ct) {
+            uint32_t valid_rows = ne01 - ct * 32;
+            valid_rows = MIN(valid_rows, 32u);
+
+            // DMA raw GGUF rows into VTCM.
+            dma_queue_push(
+                dma_queue,
+                dma_make_ptr(raw_buf, src0_expert + (size_t) ct * 32 * raw_row_size),
+                raw_row_size, raw_row_size, raw_row_size, valid_rows);
+            (void) dma_queue_pop(dma_queue);
+
+            // Convert only this working set; no model-sized REPACK allocation.
+            htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+            for (uint32_t cid = 0; cid < (uint32_t)cne1; ++cid) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, cid);
+                const int rm1 = row_mapping.i1;
+                const int rm2 = row_mapping.i2;
+                const uint32_t ir1 = fastmodulo(rm1, ne11, &mmctx->mm_div_ne11);
+                const uint8_t * restrict src1_col =
+                    src1_data + (ir1 + rm2 * ne11) * src1_stride;
+                float * restrict dst_row =
+                    (float *) (dst->data + (rm1 * nb1 + rm2 * nb2));
+
+                tiled_vec_dot_q4_0_32x1(
+                    ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+        }
+    }
+
+    (void) nth;
+}
+
+static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) {
+    htp_matmul_preamble;
+
+    const struct htp_tensor * restrict ids = octx->src[2];
+    const uint32_t src0_nrows      = ne01;
+    const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
+    const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
+
+    hvx_mm_run_quant_task(mmctx, ith);
+    if (src0_start_row >= src0_end_row) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = &octx->ctx->trace[ith];
+    const size_t src1_stride = mmctx->vtcm_src1_stride;
+    uint8_t * restrict thread_vtcm = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
+    const size_t raw_row_size = nb01;
+    const size_t raw_32_size = htp_mm_round_up(32 * raw_row_size, 256);
+    uint8_t * restrict raw_buf = thread_vtcm;
+    uint8_t * restrict tiled_buf = thread_vtcm + raw_32_size;
+    const uint8_t * restrict src1_col = mmctx->vtcm_src1;
+
+    const uint32_t n_aids = ids->ne[0];
+    const uint32_t n_ids = ne02;
+
+    for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {
+        const int32_t eid = *(const int32_t *) ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
+        if (eid < 0) continue;
+        assert(eid < (int32_t)n_ids);
+
+        const uint8_t * src0_expert = (const uint8_t *) src0->data + (size_t) eid * nb02;
+        float * restrict dst_row = (float *) (dst->data + ie1 * nb1);
+
+        const uint32_t ct_start = src0_start_row / 32;
+        const uint32_t ct_end   = (src0_end_row + 31) / 32;
+        for (uint32_t ct = ct_start; ct < ct_end; ++ct) {
+            uint32_t valid_rows = ne01 - ct * 32;
+            valid_rows = MIN(valid_rows, 32u);
+
+            dma_queue_push(
+                dma_queue,
+                dma_make_ptr(raw_buf, src0_expert + (size_t) ct * 32 * raw_row_size),
+                raw_row_size, raw_row_size, raw_row_size, valid_rows);
+            (void) dma_queue_pop(dma_queue);
+
+            htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+            tiled_vec_dot_q4_0_32x1(
+                ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+        }
+    }
+
+    (void) nth;
+}
+
 static void hvx_mm_id(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
@@ -3676,6 +3855,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
     int s;
     if (kparams->n_hmx) {
         s = hmx_mm_op_matmul_id(octx, mmctx);
+    } else if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0 &&
+               src0->type == HTP_TYPE_Q4_0) {
+        // Raw Q4_0 staging path: convert each 32-row working set in VTCM.
+        s = hvx_mm_matmul_id(octx, mmctx,
+                src1_nrows > 1 ? hvx_mm_id_raw_q4_0 : hvx_mv_id_raw_q4_0);
     } else {
         if (hvx_mm_init_vec_dot(mmctx, src0->type) == 0) {
             s = hvx_mm_matmul_id(octx, mmctx, src1_nrows > 1 ? hvx_mm_id : hvx_mv_id);
