@@ -934,6 +934,24 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+
+// Hexagon raw-Q4_0 MMID scheduler diagnostics.  This is intentionally read-only:
+// it does not alter backend selection or graph splitting.
+static bool ggml_backend_sched_dbg_raw_q4_0_mmid(const struct ggml_tensor * node) {
+    const char * env = getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
+    return env && atoi(env) != 0 &&
+           node && node->op == GGML_OP_MUL_MAT_ID &&
+           node->src[0] && node->src[0]->type == GGML_TYPE_Q4_0;
+}
+
+static const char * ggml_backend_sched_dbg_buft_name(const struct ggml_tensor * t) {
+    if (!t || !t->buffer) {
+        return "<none>";
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    return buft ? ggml_backend_buft_name(buft) : "<null-buft>";
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -983,16 +1001,41 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                const bool dbg_raw_mmid = ggml_backend_sched_dbg_raw_q4_0_mmid(tensor) && i == 0;
+                if (dbg_raw_mmid) {
+                    GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 node=%s weight_buft=%s src_backend=%s(%d) op_offload=%d host=%d\n",
+                        tensor->name,
+                        ggml_backend_sched_dbg_buft_name(src),
+                        src_backend_id >= 0 ? ggml_backend_name(sched->backends[src_backend_id]) : "<none>",
+                        src_backend_id,
+                        sched->op_offload ? 1 : 0,
+                        ggml_backend_buffer_is_host(src->buffer) ? 1 : 0);
+                }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
-                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                        const bool supports = ggml_backend_supports_op(sched->backends[b], tensor);
+                        const bool wants_offload = supports ? ggml_backend_offload_op(sched->backends[b], tensor) : false;
+                        if (dbg_raw_mmid) {
+                            GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 candidate=%s(%d) supports=%d offload_op=%d\n",
+                                ggml_backend_name(sched->backends[b]), b, supports ? 1 : 0, wants_offload ? 1 : 0);
+                        }
+                        if (supports && wants_offload) {
                             SET_CAUSE(tensor, "1.off");
+                            if (dbg_raw_mmid) {
+                                GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 choose=%s(%d) cause=1.off\n",
+                                    ggml_backend_name(sched->backends[b]), b);
+                            }
                             return b;
                         }
                     }
                 }
                 SET_CAUSE(tensor, "1.wgt%d", i);
+                if (dbg_raw_mmid) {
+                    GGML_LOG_INFO("DBG_SCHED_Q4_0: pass1 choose=%s(%d) cause=1.wgt%d\n",
+                        src_backend_id >= 0 ? ggml_backend_name(sched->backends[src_backend_id]) : "<none>",
+                        src_backend_id, i);
+                }
                 return src_backend_id;
             }
         }
@@ -1256,24 +1299,46 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         } else {
             // assigned node: upgrade to higher prio backend if possible
+            const bool dbg_raw_mmid = ggml_backend_sched_dbg_raw_q4_0_mmid(node);
+            if (dbg_raw_mmid) {
+                GGML_LOG_INFO("DBG_SCHED_Q4_0: pass3 begin node=%s assigned=%s(%d) assigned_buft=%s\n",
+                    node->name,
+                    ggml_backend_name(sched->backends[*node_backend_id]),
+                    *node_backend_id,
+                    sched->bufts[*node_backend_id] ? ggml_backend_buft_name(sched->bufts[*node_backend_id]) : "<null>");
+            }
             for (int b = 0; b < *node_backend_id; b++) {
-                if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
-                    bool supported = true;
+                const bool same_buft = sched->bufts[b] == sched->bufts[*node_backend_id];
+                const bool supports = ggml_backend_supports_op(sched->backends[b], node);
+                bool all_src_supported = true;
+                if (same_buft && supports) {
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
                         struct ggml_tensor * src = node->src[j];
                         if (src == NULL) {
                             continue;
                         }
                         if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
-                            supported = false;
+                            all_src_supported = false;
                             break;
                         }
                     }
-                    if (supported) {
-                        *node_backend_id = b;
-                        SET_CAUSE(node, "3.upg");
-                        break;
+                } else {
+                    all_src_supported = false;
+                }
+                if (dbg_raw_mmid) {
+                    GGML_LOG_INFO("DBG_SCHED_Q4_0: pass3 candidate=%s(%d) candidate_buft=%s same_buft=%d supports=%d src_compatible=%d\n",
+                        ggml_backend_name(sched->backends[b]), b,
+                        sched->bufts[b] ? ggml_backend_buft_name(sched->bufts[b]) : "<null>",
+                        same_buft ? 1 : 0, supports ? 1 : 0, all_src_supported ? 1 : 0);
+                }
+                if (same_buft && supports && all_src_supported) {
+                    *node_backend_id = b;
+                    SET_CAUSE(node, "3.upg");
+                    if (dbg_raw_mmid) {
+                        GGML_LOG_INFO("DBG_SCHED_Q4_0: pass3 upgraded node=%s to=%s(%d) cause=3.upg\n",
+                            node->name, ggml_backend_name(sched->backends[b]), b);
                     }
+                    break;
                 }
             }
         }
@@ -1309,6 +1374,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
         GGML_ASSERT(*cur_backend_id != -1);
+        if (ggml_backend_sched_dbg_raw_q4_0_mmid(node)) {
+            GGML_LOG_INFO("DBG_SCHED_Q4_0: final node=%s backend=%s(%d) cause=%s\n",
+                node->name, ggml_backend_name(sched->backends[*cur_backend_id]), *cur_backend_id, GET_CAUSE(node));
+        }
     }
 
     // pass 5: split graph, find tensors that need to be copied
