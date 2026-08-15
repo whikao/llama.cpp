@@ -1029,22 +1029,30 @@ static void dbg_v120_scan_f32(
         const uint8_t * ptr, uint32_t nbytes,
         uint32_t * nonfinite, uint32_t * maxabs_bits) {
     uint32_t bad = 0;
-    float maxabs = 0.0f;
+    uint32_t maxabs_u = 0;
     const uint32_t n = nbytes / 4u;
+
     for (uint32_t i = 0; i < n; ++i) {
-        float v = 0.0f;
-        memcpy(&v, ptr + i * 4u, 4);
-        if (!isfinite(v)) {
+        uint32_t bits = 0;
+        memcpy(&bits, ptr + i * 4u, 4);
+
+        // IEEE-754 binary32: exponent==0xff means NaN or Inf.
+        const uint32_t exp = (bits >> 23) & 0xffu;
+        if (exp == 0xffu) {
             bad++;
-        } else {
-            const float av = fabsf(v);
-            if (av > maxabs) maxabs = av;
+            continue;
+        }
+
+        // Clear sign bit. For finite non-negative floats, integer bit ordering
+        // matches numeric ordering, so this gives max(abs(v)) without libm.
+        const uint32_t abs_bits = bits & 0x7fffffffu;
+        if (abs_bits > maxabs_u) {
+            maxabs_u = abs_bits;
         }
     }
-    union { float f; uint32_t u; } u;
-    u.f = maxabs;
+
     *nonfinite = bad;
-    *maxabs_bits = u.u;
+    *maxabs_bits = maxabs_u;
 }
 
 static void dbg_v120_capture_mmid_slices(
