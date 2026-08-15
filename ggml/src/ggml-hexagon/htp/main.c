@@ -1078,6 +1078,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     int8_t  dbg_q8_scalar[32] = {0};
     int8_t  dbg_q4_weight[32] = {0};
     int16_t dbg_prod_delta[32] = {0};
+    int32_t  dbg_vrmpy_actual[8] = {0};
+    int32_t  dbg_vrmpy_manual[8] = {0};
+    uint32_t dbg_vrmpy_w4[8] = {0};
+    uint32_t dbg_vrmpy_a4[8] = {0};
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1139,6 +1143,21 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             for (uint32_t pi = 0; pi < 16; ++pi) {
                 uint32_t wd = (uint32_t) octx->kernel_params[64 + pi];
                 memcpy(&dbg_prod_delta[pi * 2u], &wd, 4);
+            }
+            for (uint32_t gi = 0;
+                 gi < 8u; ++gi) {
+                dbg_vrmpy_actual[gi] =
+                    (int32_t)
+                        octx->kernel_params[80 + gi];
+                dbg_vrmpy_manual[gi] =
+                    (int32_t)
+                        octx->kernel_params[88 + gi];
+                dbg_vrmpy_w4[gi] =
+                    (uint32_t)
+                        octx->kernel_params[96 + gi];
+                dbg_vrmpy_a4[gi] =
+                    (uint32_t)
+                        octx->kernel_params[104 + gi];
             }
         }
 
@@ -1217,6 +1236,22 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     memcpy(rsp.dbg_q8_scalar, dbg_q8_scalar, sizeof(dbg_q8_scalar));
     memcpy(rsp.dbg_q4_weight, dbg_q4_weight, sizeof(dbg_q4_weight));
     memcpy(rsp.dbg_prod_delta, dbg_prod_delta, sizeof(dbg_prod_delta));
+    memcpy(
+        rsp.dbg_vrmpy_actual,
+        dbg_vrmpy_actual,
+        sizeof(dbg_vrmpy_actual));
+    memcpy(
+        rsp.dbg_vrmpy_manual,
+        dbg_vrmpy_manual,
+        sizeof(dbg_vrmpy_manual));
+    memcpy(
+        rsp.dbg_vrmpy_w4,
+        dbg_vrmpy_w4,
+        sizeof(dbg_vrmpy_w4));
+    memcpy(
+        rsp.dbg_vrmpy_a4,
+        dbg_vrmpy_a4,
+        sizeof(dbg_vrmpy_a4));
     rsp.dbg_runtime_k =
         ((uint32_t) octx->kernel_params[HTP_MM_DEBUG_CTRL_WORD_MAGIC] ==
          HTP_MM_DEBUG_CTRL_MAGIC)

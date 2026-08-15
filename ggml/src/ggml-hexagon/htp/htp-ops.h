@@ -303,6 +303,12 @@ struct htp_opbatch_rsp {
     int8_t  dbg_q4_weight[32];
     int16_t dbg_prod_delta[32];
 
+    // v10.17: 8 exact vrmpy groups.
+    int32_t  dbg_vrmpy_actual[8];
+    int32_t  dbg_vrmpy_manual[8];
+    uint32_t dbg_vrmpy_w4[8];
+    uint32_t dbg_vrmpy_a4[8];
+
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 
