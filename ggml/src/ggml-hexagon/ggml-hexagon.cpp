@@ -1883,6 +1883,30 @@ struct ggml_hexagon_opqueue {
                     q4_scale_fp16,
                     q8_scale_fp16);
 
+                int32_t delta_sum = 0;
+                for (uint32_t ei = 0; ei < 32; ++ei) {
+                    delta_sum += rsp.dbg_prod_delta[ei];
+                    if (rsp.dbg_q8_actual[ei] != rsp.dbg_q8_scalar[ei] ||
+                        rsp.dbg_prod_delta[ei] != 0) {
+                        GGML_LOG_INFO(
+                            "DBG_V115_Q8_ELEM: tile=%u k=%u q4=%d "
+                            "q8_actual=%d q8_scalar=%d prod_delta=%d\n",
+                            rsp.dbg_runtime_k / 32u - 1u,
+                            rsp.dbg_runtime_k - 32u + ei,
+                            (int) rsp.dbg_q4_weight[ei],
+                            (int) rsp.dbg_q8_actual[ei],
+                            (int) rsp.dbg_q8_scalar[ei],
+                            (int) rsp.dbg_prod_delta[ei]);
+                    }
+                }
+                GGML_LOG_INFO(
+                    "DBG_V115_Q8_SUM: tile=%u delta_sum=%d "
+                    "hvx_minus_scalar_int=%d\n",
+                    rsp.dbg_runtime_k / 32u - 1u,
+                    delta_sum,
+                    rsp.dbg_hvx_int_dot - rsp.dbg_k32_int_dot);
+
+
                 ++dbg_v104_host_count;
             }
         }
