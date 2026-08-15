@@ -220,6 +220,8 @@ struct htp_opbatch_req {
     // struct htp_op_desc   ops[];     -- dspqueue buf 0
 };
 
+#define HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC 0x51343034u  /* "Q404": v10.4 raw-Q4_0 debug response */
+
 struct htp_opbatch_rsp {
     uint32_t id;         // Batch id
     uint32_t status;     // HTP_STATUS_...
@@ -231,6 +233,17 @@ struct htp_opbatch_rsp {
     uint32_t pad;            // align to 8 bytes
     uint64_t cycles_start;   // Start cycle counter
     uint64_t cycles_stop;    // Stop cycle counter
+
+    // v10.4: explicit DSP -> Host raw-Q4_0 correctness return.
+    // This structure itself is transported by dspqueue_write(), whose buffer flags
+    // already flush the DSP sender and invalidate the CPU recipient.
+    uint32_t dbg_magic;      // HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC when valid
+    uint32_t dbg_op_index;   // op index within this batch
+    uint32_t dbg_expert;     // selected expert id captured by DSP
+    uint32_t dbg_src_off;    // expert * nb02 used by DSP
+    uint32_t dbg_raw_fnv;    // FNV-1a of raw selected-expert working set
+    uint32_t dbg_tile_fnv;   // FNV-1a of first converted tiled Q4_0 tile
+
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 

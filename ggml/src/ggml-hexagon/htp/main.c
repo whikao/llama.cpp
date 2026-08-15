@@ -1038,12 +1038,35 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     }
 
     int op_status = HTP_STATUS_OK;
+
+    // v10.4: first raw-Q4_0 debug result observed in this batch.
+    uint32_t dbg_magic    = 0;
+    uint32_t dbg_op_index = 0;
+    uint32_t dbg_expert   = 0;
+    uint32_t dbg_src_off  = 0;
+    uint32_t dbg_raw_fnv  = 0;
+    uint32_t dbg_tile_fnv = 0;
+
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
 
         profile_start(ctx->profiler, &prof);
 
         op_status = proc_op_req(octx, tens, i, &ops[i]);
+
+        // op_matmul_id() v10.3 stores its first selected-expert fingerprint into
+        // the *local* octx->kernel_params copy after computation. Capture it here,
+        // while it is guaranteed to still belong to this op. This avoids relying
+        // on writes propagating back into the shared htp_op_desc.
+        if (dbg_magic == 0 &&
+            (uint32_t) octx->kernel_params[0] == HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC) {
+            dbg_magic    = HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC;
+            dbg_op_index = i;
+            dbg_expert   = (uint32_t) octx->kernel_params[1];
+            dbg_raw_fnv  = (uint32_t) octx->kernel_params[2];
+            dbg_tile_fnv = (uint32_t) octx->kernel_params[3];
+            dbg_src_off  = (uint32_t) octx->kernel_params[4];
+        }
 
         profile_stop(ctx->profiler, &prof);
 
@@ -1081,6 +1104,13 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.usecs        = batch_prof.usecs;
     rsp.cycles_start = batch_prof.cycles_start;
     rsp.cycles_stop  = batch_prof.cycles_stop;
+
+    rsp.dbg_magic    = dbg_magic;
+    rsp.dbg_op_index = dbg_op_index;
+    rsp.dbg_expert   = dbg_expert;
+    rsp.dbg_src_off  = dbg_src_off;
+    rsp.dbg_raw_fnv  = dbg_raw_fnv;
+    rsp.dbg_tile_fnv = dbg_tile_fnv;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {
