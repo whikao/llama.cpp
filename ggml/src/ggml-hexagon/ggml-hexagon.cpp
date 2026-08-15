@@ -32,27 +32,6 @@
 #else
 #    include <semaphore.h>
 #    include <unistd.h>
-#    include <sys/ioctl.h>
-#    if defined(__has_include)
-#        if __has_include(<linux/dma-buf.h>)
-#            include <linux/dma-buf.h>
-#        endif
-#    endif
-
-// Android NDKs normally provide <linux/dma-buf.h>. Keep a small fallback here
-// so this experimental build does not depend on a particular NDK header revision.
-#    ifndef DMA_BUF_IOCTL_SYNC
-struct dma_buf_sync {
-    uint64_t flags;
-};
-#        define DMA_BUF_BASE 'b'
-#        define DMA_BUF_SYNC_READ  (1ull << 0)
-#        define DMA_BUF_SYNC_WRITE (2ull << 0)
-#        define DMA_BUF_SYNC_RW    (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
-#        define DMA_BUF_SYNC_START (0ull << 2)
-#        define DMA_BUF_SYNC_END   (1ull << 2)
-#        define DMA_BUF_IOCTL_SYNC _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
-#    endif
 #endif
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -116,56 +95,6 @@ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
 #define HEX_VERBOSE(...) \
     if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
-
-// v10.5: bracket CPU writes to rpcmem/dma-buf so the exporter performs the
-// required CPU <-> device cache maintenance. A compiler/CPU memory barrier is
-// not sufficient for HTP visibility.
-static bool ggml_hexagon_dmabuf_sync_write(
-        int fd, bool begin, const char * dev, const char * tensor,
-        size_t offset, size_t size) {
-#ifdef _WIN32
-    GGML_UNUSED(fd);
-    GGML_UNUSED(begin);
-    GGML_UNUSED(dev);
-    GGML_UNUSED(tensor);
-    GGML_UNUSED(offset);
-    GGML_UNUSED(size);
-    return true;
-#else
-    struct dma_buf_sync sync = {};
-    sync.flags = DMA_BUF_SYNC_WRITE | (begin ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END);
-
-    int rc;
-    do {
-        errno = 0;
-        rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
-    } while (rc != 0 && errno == EINTR);
-
-    static int logged_ok = 0;
-    static int logged_err = 0;
-    if (rc == 0) {
-        if (logged_ok < 16) {
-            GGML_LOG_INFO(
-                "DBG_V105_DMA_SYNC: dev=%s phase=%s fd=%d tensor=%s offset=%zu size=%zu rc=0\n",
-                dev, begin ? "START_WRITE" : "END_WRITE",
-                fd, tensor ? tensor : "<null>", offset, size);
-            ++logged_ok;
-        }
-        return true;
-    }
-
-    if (logged_err < 16) {
-        const int e = errno;
-        GGML_LOG_ERROR(
-            "DBG_V105_DMA_SYNC_FAIL: dev=%s phase=%s fd=%d tensor=%s offset=%zu size=%zu "
-            "errno=%d (%s)\n",
-            dev, begin ? "START_WRITE" : "END_WRITE",
-            fd, tensor ? tensor : "<null>", offset, size, e, std::strerror(e));
-        ++logged_err;
-    }
-    return false;
-#endif
-}
 
 static const char * status_to_str(uint32_t status) {
     switch (status) {
@@ -1061,29 +990,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                         sess->c_name(), tensor->name, offset, size, ggml_nbytes(tensor));
                     logged_raw_set = true;
                 }
-                // v10.5 correctness fix: scheduler reuses this rpcmem/dma-buf
-                // staging allocation for gate/up/down experts. Bracket each CPU write
-                // with DMA_BUF_IOCTL_SYNC so subsequent HTP reads see the new bytes.
-                //
-                // START_WRITE invalidates/prepares the CPU mapping for access;
-                // END_WRITE flushes CPU-written cache lines back for the device.
-                const bool sync_start_ok = ggml_hexagon_dmabuf_sync_write(
-                    sbuf->fd, true, sess->c_name(), tensor->name, offset, size);
-
                 memcpy((char *) tensor->data + offset, data, size);
-
-                const bool sync_end_ok = ggml_hexagon_dmabuf_sync_write(
-                    sbuf->fd, false, sess->c_name(), tensor->name, offset, size);
-
-                static int dbg_v105_pair_count = 0;
-                if (dbg_v105_pair_count < 16) {
-                    GGML_LOG_INFO(
-                        "DBG_V105_STAGE_SYNCED: dev=%s tensor=%s offset=%zu size=%zu "
-                        "start_ok=%d end_ok=%d\n",
-                        sess->c_name(), tensor->name, offset, size,
-                        sync_start_ok ? 1 : 0, sync_end_ok ? 1 : 0);
-                    ++dbg_v105_pair_count;
-                }
 
                 // v10.2: fingerprint the first fully copied expert in this sparse
                 // scheduler write.  Unlike v10/v10.1 this is inserted directly
@@ -1150,12 +1057,13 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                         }
 
                         GGML_LOG_INFO(
-                            "DBG_V102_HOST: dev=%s tensor=%s expert=%zu copy_off=%zu copy_size=%zu "
-                            "nb01=%zu nb02=%zu raw_bytes=%zu raw_fnv=%08x tile_fnv=%08x "
-                            "first=%02x%02x%02x%02x scale=%02x%02x\\n",
+                            "DBG_V106_HOST_REF: dev=%s tensor=%s expert=%zu ct=0 valid_rows=%d "
+                            "copy_off=%zu copy_size=%zu nb01=%zu nb02=%zu raw_bytes=%zu "
+                            "raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x\\n",
                             sess->c_name(),
                             tensor->name,
                             expert_id,
+                            valid_rows,
                             offset,
                             size,
                             tensor->nb[1],
@@ -1794,11 +1702,15 @@ struct ggml_hexagon_opqueue {
             static int dbg_v104_host_count = 0;
             if (dbg_v104_host_count < 64) {
                 GGML_LOG_INFO(
-                    "DBG_V104_DSP_RETURN: dev=%s batch=%u op=%u expert=%u src_off=%u raw_fnv=%08x tile_fnv=%08x\n",
+                    "DBG_V106_DSP_RETURN: dev=%s batch=%u op=%u expert=%u ct=%u ith=%u valid_rows=%u "
+                    "src_off=%u raw_fnv=%08x tile_fnv=%08x\n",
                     shm_buf->sess->c_name(),
                     rsp.id,
                     rsp.dbg_op_index,
                     rsp.dbg_expert,
+                    rsp.dbg_ct,
+                    rsp.dbg_ith,
+                    rsp.dbg_valid_rows,
                     rsp.dbg_src_off,
                     rsp.dbg_raw_fnv,
                     rsp.dbg_tile_fnv);
