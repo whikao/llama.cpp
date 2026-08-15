@@ -3,6 +3,13 @@ name: Build llama.cpp Android CPU + Hexagon (UMA fit v4)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  PACKAGE_FILE: llama.cpp-android-hexagon-uma-fit-v4.tar.gz
+  RELEASE_TAG: llama-android-hexagon-phone-latest
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -99,12 +106,66 @@ jobs:
         run: |
           set -euo pipefail
           cd pkg-snapdragon
-          tar -czf ../llama.cpp-android-hexagon-uma-fit-v4.tar.gz llama.cpp
+          tar -czf "../$PACKAGE_FILE" llama.cpp
+
+      - name: Create build metadata
+        run: |
+          set -euo pipefail
+          sha256sum "$PACKAGE_FILE" > SHA256SUMS
+          printf '%s\n' \
+            "repository=$GITHUB_REPOSITORY" \
+            "commit=$GITHUB_SHA" \
+            "ref=$GITHUB_REF_NAME" \
+            "run_id=$GITHUB_RUN_ID" \
+            "run_number=$GITHUB_RUN_NUMBER" \
+            "run_url=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > BUILD_INFO.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: llama.cpp-android-hexagon-uma-fit-v4
-          path: llama.cpp-android-hexagon-uma-fit-v4.tar.gz
+          path: |
+            ${{ env.PACKAGE_FILE }}
+            SHA256SUMS
+            BUILD_INFO.txt
           if-no-files-found: error
           compression-level: 0
+
+      - name: Publish rolling Termux release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          printf '%s\n' \
+            "Rolling Android CPU + Hexagon build for direct Termux download." \
+            "" \
+            "Commit: $GITHUB_SHA" \
+            "Ref: $GITHUB_REF_NAME" \
+            "Actions run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "" \
+            "The tag is a stable download location. BUILD_INFO.txt identifies the actual source commit." \
+            > "$notes_file"
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "llama.cpp Android Hexagon phone latest" \
+              --notes-file "$notes_file" \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "llama.cpp Android Hexagon phone latest" \
+              --notes-file "$notes_file" \
+              --prerelease
+          fi
+
+          gh release upload "$RELEASE_TAG" \
+            "$PACKAGE_FILE" SHA256SUMS BUILD_INFO.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
