@@ -1069,6 +1069,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     uint32_t dbg_src_f0_bits = 0;
     uint32_t dbg_src_max_bits= 0;
     uint32_t dbg_q8_row_fnv  = 0;
+    uint32_t dbg_hvx_k32_bits = 0;
+    uint32_t dbg_ref_k32_bits = 0;
+    int32_t  dbg_k32_int_dot  = 0;
+    uint32_t dbg_k32_scales_fp16 = 0;
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1113,6 +1117,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             dbg_src_f0_bits = (uint32_t) octx->kernel_params[25];
             dbg_src_max_bits= (uint32_t) octx->kernel_params[26];
             dbg_q8_row_fnv  = (uint32_t) octx->kernel_params[27];
+            dbg_hvx_k32_bits = (uint32_t) octx->kernel_params[28];
+            dbg_ref_k32_bits = (uint32_t) octx->kernel_params[29];
+            dbg_k32_int_dot  = (int32_t)  octx->kernel_params[30];
+            dbg_k32_scales_fp16 = (uint32_t) octx->kernel_params[31];
         }
 
         profile_stop(ctx->profiler, &prof);
@@ -1181,6 +1189,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_src_f0_bits = dbg_src_f0_bits;
     rsp.dbg_src_max_bits= dbg_src_max_bits;
     rsp.dbg_q8_row_fnv  = dbg_q8_row_fnv;
+    rsp.dbg_hvx_k32_bits = dbg_hvx_k32_bits;
+    rsp.dbg_ref_k32_bits = dbg_ref_k32_bits;
+    rsp.dbg_k32_int_dot  = dbg_k32_int_dot;
+    rsp.dbg_k32_scales_fp16 = dbg_k32_scales_fp16;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {

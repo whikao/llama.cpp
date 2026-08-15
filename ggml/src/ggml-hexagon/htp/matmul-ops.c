@@ -103,6 +103,12 @@ struct htp_mm_context {
     uint32_t dbg_v109_src_max_bits;  // max(abs(src[0..127])) as F32 bits
     uint32_t dbg_v109_row_fnv;       // whole quantized src1 row (vtcm_src1_stride bytes)
 
+    // v10.11: first K=32 block, row-0 HTP-vs-scalar reference.
+    uint32_t dbg_v111_hvx_k32_bits;
+    uint32_t dbg_v111_ref_k32_bits;
+    int32_t  dbg_v111_int_dot;
+    uint32_t dbg_v111_scales_fp16;   // low16=Q4 scale, high16=Q8 scale
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1415,6 +1421,81 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                         fnv_dot *= 16777619u;
                     }
                     mmctx->dbg_v109_dot_fnv = fnv_dot;
+                }
+
+                // v10.11: exact first-K=32 probe for the deterministic debug path.
+                // We call the SAME tiled kernel with n=32 into a temporary buffer,
+                // then independently form a scalar row-0 reference from:
+                //   - the raw GGUF Q4_0 block in raw_buf,
+                //   - the original F32 activation row,
+                //   - the actual Q8 scale emitted by the HTP quantizer.
+                // The normal full-K result below is untouched.
+                if (ct == 0 && cid == 0 &&
+                    cur_a == mmctx->dbg_v103_expert &&
+                    mmctx->dbg_v103_claimed) {
+                    float hvx_k32[32] __attribute__((aligned(128)));
+                    memset(hvx_k32, 0, sizeof(hvx_k32));
+                    tiled_vec_dot_q4_0_32x1(
+                        32, hvx_k32, tiled_buf, src1_col, valid_rows, NULL);
+
+                    const uint8_t * q4_block = raw_buf; // row 0, K tile 0
+                    uint16_t q4_scale_u16 = 0;
+                    memcpy(&q4_scale_u16, q4_block, sizeof(q4_scale_u16));
+                    __fp16 q4_scale_h;
+                    memcpy(&q4_scale_h, &q4_scale_u16, sizeof(q4_scale_h));
+
+                    uint16_t q8_scale_u16 = 0;
+                    memcpy(&q8_scale_u16, src1_col + 1024, sizeof(q8_scale_u16));
+                    __fp16 q8_scale_h;
+                    memcpy(&q8_scale_h, &q8_scale_u16, sizeof(q8_scale_h));
+
+                    const float q4_scale_f = (float) q4_scale_h;
+                    const float q8_scale_f = (float) q8_scale_h;
+
+                    // src1_col flattens (ir1 + rm2 * ne11).  The corresponding
+                    // original F32 row is src1 + ir1*nb11 + rm2*nb12.
+                    const uint8_t * src1_orig_bytes =
+                        (const uint8_t *) src1->data +
+                        (size_t) ir1 * nb11 +
+                        (size_t) rm2 * nb12;
+
+                    int32_t int_dot = 0;
+                    const uint8_t * qs = q4_block + 2;
+                    for (uint32_t ki = 0; ki < 32; ++ki) {
+                        const int32_t qw =
+                            (int32_t) htp_raw_q4_0_get_nibble(qs, ki) - 8;
+
+                        float xf = 0.0f;
+                        memcpy(&xf, src1_orig_bytes + (size_t) ki * nb10, sizeof(xf));
+
+                        // HTP Q8_0 tiled quantization first converts activation
+                        // values/scales through f16. Use the actual emitted Q8
+                        // scale and the same nearest-integer saturation model.
+                        const __fp16 xh = (__fp16) xf;
+                        int32_t qa = 0;
+                        if (q8_scale_f != 0.0f && isfinite(q8_scale_f)) {
+                            const float qf = (float) xh / q8_scale_f;
+                            qa = (int32_t) roundf(qf);
+                            if (qa > 127)  qa = 127;
+                            if (qa < -128) qa = -128;
+                        }
+
+                        int_dot += qw * qa;
+                    }
+
+                    const float ref_k32 =
+                        (float) int_dot * q4_scale_f * q8_scale_f;
+
+                    union { float f; uint32_t u; } hvx_u, ref_u;
+                    hvx_u.f = hvx_k32[0];
+                    ref_u.f = ref_k32;
+
+                    mmctx->dbg_v111_hvx_k32_bits = hvx_u.u;
+                    mmctx->dbg_v111_ref_k32_bits = ref_u.u;
+                    mmctx->dbg_v111_int_dot      = int_dot;
+                    mmctx->dbg_v111_scales_fp16  =
+                        (uint32_t) q4_scale_u16 |
+                        ((uint32_t) q8_scale_u16 << 16);
                 }
 
                 tiled_vec_dot_q4_0_32x1(
@@ -4088,6 +4169,12 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_words[25] = (int32_t) mmctx->dbg_v109_src_f0_bits;
         dbg_words[26] = (int32_t) mmctx->dbg_v109_src_max_bits;
         dbg_words[27] = (int32_t) mmctx->dbg_v109_row_fnv;
+
+        // v10.11: last four words of the existing 128-byte kernel_params blob.
+        dbg_words[28] = (int32_t) mmctx->dbg_v111_hvx_k32_bits;
+        dbg_words[29] = (int32_t) mmctx->dbg_v111_ref_k32_bits;
+        dbg_words[30] = (int32_t) mmctx->dbg_v111_int_dot;
+        dbg_words[31] = (int32_t) mmctx->dbg_v111_scales_fp16;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {

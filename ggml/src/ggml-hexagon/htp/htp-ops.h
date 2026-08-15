@@ -273,6 +273,12 @@ struct htp_opbatch_rsp {
     uint32_t dbg_src_max_bits;
     uint32_t dbg_q8_row_fnv;
 
+    // v10.11: first K=32 row-0 kernel/reference comparison.
+    uint32_t dbg_hvx_k32_bits;
+    uint32_t dbg_ref_k32_bits;
+    int32_t  dbg_k32_int_dot;
+    uint32_t dbg_k32_scales_fp16;
+
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 
