@@ -293,6 +293,10 @@ struct htp_opbatch_rsp {
     // v10.12 runtime-selected cumulative-K checkpoint.
     uint32_t dbg_runtime_k;
 
+    // v10.14: row-0 integer accumulator produced by the exact HVX
+    // accum_4bit_32x1() path for the selected single tile.
+    int32_t dbg_hvx_int_dot;
+
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 

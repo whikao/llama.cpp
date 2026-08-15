@@ -1463,6 +1463,26 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     dbg_k = (dbg_k / 32u) * 32u;
                     if (dbg_k < 32u) dbg_k = 32u;
 
+                    // v10.14: GGML_HEXAGON_DEBUG_K selects the tile immediately
+                    // before this boundary. K=192 => tile 5 => logical K 160..191.
+                    const uint32_t dbg_tile_idx = dbg_k / 32u - 1u;
+                    const uint8_t * dbg_wtile =
+                        tiled_buf + (size_t) dbg_tile_idx * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
+                    const uint8_t * dbg_atile =
+                        src1_col + (size_t) dbg_tile_idx * HTP_MM_ACT_TILE_SIZE_Q8_0;
+
+                    // Run the exact integer helper used by the official kernel.
+                    // This deliberately avoids any scalar reconstruction of the
+                    // tiled lane permutation.
+                    const HVX_Vector * dbg_vptr = (const HVX_Vector *) dbg_wtile;
+                    const HVX_Vector * dbg_vact = (const HVX_Vector *) dbg_atile;
+                    HVX_Vector dbg_i8 = Q6_Vb_vsplat_R(8);
+                    HVX_Vector dbg_vsum =
+                        accum_4bit_32x1(dbg_vptr, dbg_vact, dbg_i8);
+                    int32_t dbg_vsum_words[32] __attribute__((aligned(128)));
+                    hvx_vec_store_u(dbg_vsum_words, 128, dbg_vsum);
+                    const int32_t dbg_hvx_int_dot = dbg_vsum_words[0];
+
                     float hvx_k32[32] __attribute__((aligned(128)));
                     memset(hvx_k32, 0, sizeof(hvx_k32));
                     tiled_vec_dot_q4_0_32x1(
@@ -1489,75 +1509,70 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                         (size_t) ir1 * nb11 +
                         (size_t) rm2 * nb12;
 
-                    // v10.13 exact-tile probe:
-                    // GGML_HEXAGON_DEBUG_K selects a cumulative boundary; the
-                    // tile immediately before that boundary is probed exactly.
-                    // Example: K=192 -> tile index 5 -> K[160..191].
-                    const uint32_t dbg_tile_idx = dbg_k / 32u - 1u;
+                    // Scalar comparison for exactly the selected logical
+                    // Q4_0 block, using raw GGUF weights + original F32 activation.
+                    // This is the already-useful v10.12 reference model, now
+                    // applied to tile dbg_tile_idx rather than a K prefix.
+                    const uint8_t * q4b =
+                        raw_buf + (size_t) dbg_tile_idx * 18u;
 
-                    const uint8_t * wtile =
-                        tiled_buf +
-                        (size_t) dbg_tile_idx * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
-                    const uint8_t * atile =
-                        src1_col +
-                        (size_t) dbg_tile_idx * HTP_MM_ACT_TILE_SIZE_Q8_0;
+                    uint16_t q4s_u16 = 0;
+                    memcpy(&q4s_u16, q4b, sizeof(q4s_u16));
+                    __fp16 q4s_h;
+                    memcpy(&q4s_h, &q4s_u16, sizeof(q4s_h));
 
-                    // Real kernel contribution for exactly this one K=32 tile.
+                    uint16_t q8s_u16 = 0;
+                    memcpy(&q8s_u16, dbg_atile + 1024, sizeof(q8s_u16));
+                    __fp16 q8s_h;
+                    memcpy(&q8s_h, &q8s_u16, sizeof(q8s_h));
+                    const float q8s_f = (float) q8s_h;
+
+                    int32_t scalar_int_dot = 0;
+                    const uint8_t * qs = q4b + 2;
+                    for (uint32_t kli = 0; kli < 32; ++kli) {
+                        const uint32_t ki = dbg_tile_idx * 32u + kli;
+                        const int32_t qw =
+                            (int32_t) htp_raw_q4_0_get_nibble(qs, kli) - 8;
+
+                        float xf = 0.0f;
+                        memcpy(&xf,
+                            src1_orig_bytes + (size_t) ki * nb10,
+                            sizeof(xf));
+
+                        const __fp16 xh = (__fp16) xf;
+                        int32_t qa = 0;
+                        if (q8s_f != 0.0f && isfinite(q8s_f)) {
+                            qa = (int32_t) roundf((float) xh / q8s_f);
+                            if (qa > 127)  qa = 127;
+                            if (qa < -128) qa = -128;
+                        }
+                        scalar_int_dot += qw * qa;
+                    }
+
+                    const float scalar_ref =
+                        (float) scalar_int_dot * (float) q4s_h * q8s_f;
+
+                    // Exact single-tile floating result from the official kernel.
                     float hvx_tile[32] __attribute__((aligned(128)));
                     memset(hvx_tile, 0, sizeof(hvx_tile));
                     tiled_vec_dot_q4_0_32x1(
-                        32, hvx_tile, wtile, atile, valid_rows, NULL);
-
-                    // Scalar reference from the ACTUAL tiled bytes consumed by
-                    // the kernel. No F32 re-quantization and no raw-Q4 decode.
-                    //
-                    // Confirmed tiled layout for row 0:
-                    //   Q4: packed pair at wtile[cp * 32 + row]
-                    //   Q8: pair at atile[cp * 64 + 2*row + {0,1}]
-                    //   Q4 scales: fp16 vector at wtile + 512
-                    //   Q8 scales: fp16 vector at atile + 1024
-                    int32_t exact_int_dot = 0;
-                    for (uint32_t cp = 0; cp < 16; ++cp) {
-                        const uint8_t packed = wtile[cp * 32u];
-                        const int32_t qw0 = (int32_t) (packed & 0x0fu) - 8;
-                        const int32_t qw1 = (int32_t) (packed >> 4) - 8;
-
-                        const int32_t qa0 =
-                            (int32_t) ((const int8_t *) atile)[cp * 64u + 0u];
-                        const int32_t qa1 =
-                            (int32_t) ((const int8_t *) atile)[cp * 64u + 1u];
-
-                        exact_int_dot += qw0 * qa0 + qw1 * qa1;
-                    }
-
-                    uint16_t exact_q4_scale_u16 = 0;
-                    uint16_t exact_q8_scale_u16 = 0;
-                    memcpy(&exact_q4_scale_u16, wtile + 512, sizeof(exact_q4_scale_u16));
-                    memcpy(&exact_q8_scale_u16, atile + 1024, sizeof(exact_q8_scale_u16));
-
-                    __fp16 exact_q4_scale_h;
-                    __fp16 exact_q8_scale_h;
-                    memcpy(&exact_q4_scale_h, &exact_q4_scale_u16, sizeof(exact_q4_scale_h));
-                    memcpy(&exact_q8_scale_h, &exact_q8_scale_u16, sizeof(exact_q8_scale_h));
-
-                    const float exact_ref =
-                        (float) exact_int_dot *
-                        (float) exact_q4_scale_h *
-                        (float) exact_q8_scale_h;
+                        32, hvx_tile, dbg_wtile, dbg_atile, valid_rows, NULL);
 
                     union { float f; uint32_t u; } hvx_u, ref_u;
                     hvx_u.f = hvx_tile[0];
-                    ref_u.f = exact_ref;
+                    ref_u.f = scalar_ref;
 
-                    // Reuse the established v10.11 4-word DSP->Host transport.
-                    // In v10.13 runtime debug mode these fields now describe the
-                    // exact selected tile, not a cumulative K prefix.
                     mmctx->dbg_v111_hvx_k32_bits = hvx_u.u;
                     mmctx->dbg_v111_ref_k32_bits = ref_u.u;
-                    mmctx->dbg_v111_int_dot      = exact_int_dot;
+                    mmctx->dbg_v111_int_dot      = scalar_int_dot;
                     mmctx->dbg_v111_scales_fp16  =
-                        (uint32_t) exact_q4_scale_u16 |
-                        ((uint32_t) exact_q8_scale_u16 << 16);
+                        (uint32_t) q4s_u16 |
+                        ((uint32_t) q8s_u16 << 16);
+
+                    // Word 31 was previously scales; keep it.  The new HVX
+                    // integer dot is carried through an added response field
+                    // populated from a spare debug word below.
+                    mmctx->dbg_v112_actual_k = (uint32_t) dbg_hvx_int_dot;
                 }
 
                 tiled_vec_dot_q4_0_32x1(
@@ -4251,6 +4266,8 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_words[29] = (int32_t) mmctx->dbg_v111_ref_k32_bits;
         dbg_words[30] = (int32_t) mmctx->dbg_v111_int_dot;
         dbg_words[31] = (int32_t) mmctx->dbg_v111_scales_fp16;
+        // v10.14: exact HVX integer accumulator, row 0, selected tile.
+        dbg_words[16] = (int32_t) mmctx->dbg_v112_actual_k;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {

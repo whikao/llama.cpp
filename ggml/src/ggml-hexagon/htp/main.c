@@ -1073,6 +1073,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     uint32_t dbg_ref_k32_bits = 0;
     int32_t  dbg_k32_int_dot  = 0;
     uint32_t dbg_k32_scales_fp16 = 0;
+    int32_t dbg_hvx_int_dot = 0;
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1121,6 +1122,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             dbg_ref_k32_bits = (uint32_t) octx->kernel_params[29];
             dbg_k32_int_dot  = (int32_t)  octx->kernel_params[30];
             dbg_k32_scales_fp16 = (uint32_t) octx->kernel_params[31];
+            dbg_hvx_int_dot = (int32_t) octx->kernel_params[16];
         }
 
         profile_stop(ctx->profiler, &prof);
@@ -1193,6 +1195,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_ref_k32_bits = dbg_ref_k32_bits;
     rsp.dbg_k32_int_dot  = dbg_k32_int_dot;
     rsp.dbg_k32_scales_fp16 = dbg_k32_scales_fp16;
+    rsp.dbg_hvx_int_dot = dbg_hvx_int_dot;
     rsp.dbg_runtime_k =
         ((uint32_t) octx->kernel_params[HTP_MM_DEBUG_CTRL_WORD_MAGIC] ==
          HTP_MM_DEBUG_CTRL_MAGIC)
