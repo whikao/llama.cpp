@@ -1827,6 +1827,24 @@ struct ggml_hexagon_opqueue {
                     rsp.dbg_out3,
                     o0.f, o1.f, o2.f, o3.f);
 
+                union { uint32_t u; float f; } full_ref;
+                full_ref.u = rsp.dbg_full_ref_bits;
+                GGML_LOG_INFO(
+                    "DBG_V118_FULL_REF: dev=%s batch=%u op=%u expert=%u ct=%u "
+                    "htp_full=%g exact_ref=%g diff=%g "
+                    "htp_bits=%08x ref_bits=%08x\n",
+                    shm_buf->sess->c_name(),
+                    rsp.id,
+                    rsp.dbg_op_index,
+                    rsp.dbg_expert,
+                    rsp.dbg_ct,
+                    o0.f,
+                    full_ref.f,
+                    o0.f - full_ref.f,
+                    rsp.dbg_out0,
+                    rsp.dbg_full_ref_bits);
+
+
                 union { uint32_t u; float f; } sf0, smax;
                 sf0.u  = rsp.dbg_src_f0_bits;
                 smax.u = rsp.dbg_src_max_bits;
@@ -1905,50 +1923,6 @@ struct ggml_hexagon_opqueue {
                     rsp.dbg_runtime_k / 32u - 1u,
                     delta_sum,
                     rsp.dbg_hvx_int_dot - rsp.dbg_k32_int_dot);
-
-                int32_t vrmpy_actual_sum = 0;
-                int32_t vrmpy_manual_sum = 0;
-                for (uint32_t gi = 0;
-                     gi < 8u; ++gi) {
-                    int8_t wb[4];
-                    int8_t ab[4];
-                    memcpy(
-                        wb,
-                        &rsp.dbg_vrmpy_w4[gi], 4);
-                    memcpy(
-                        ab,
-                        &rsp.dbg_vrmpy_a4[gi], 4);
-
-                    vrmpy_actual_sum +=
-                        rsp.dbg_vrmpy_actual[gi];
-                    vrmpy_manual_sum +=
-                        rsp.dbg_vrmpy_manual[gi];
-
-                    GGML_LOG_INFO(
-                        "DBG_V117_VRMPY: g=%u "
-                        "actual=%d manual=%d "
-                        "w=%d,%d,%d,%d "
-                        "a=%d,%d,%d,%d\n",
-                        gi,
-                        rsp.dbg_vrmpy_actual[gi],
-                        rsp.dbg_vrmpy_manual[gi],
-                        (int) wb[0],
-                        (int) wb[1],
-                        (int) wb[2],
-                        (int) wb[3],
-                        (int) ab[0],
-                        (int) ab[1],
-                        (int) ab[2],
-                        (int) ab[3]);
-                }
-                GGML_LOG_INFO(
-                    "DBG_V117_VRMPY_SUM: "
-                    "actual_sum=%d manual_sum=%d "
-                    "hvx_int_dot=%d\n",
-                    vrmpy_actual_sum,
-                    vrmpy_manual_sum,
-                    rsp.dbg_hvx_int_dot);
-
 
 
                 ++dbg_v104_host_count;
