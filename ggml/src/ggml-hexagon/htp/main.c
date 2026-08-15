@@ -1025,6 +1025,134 @@ static void dbg_v119_capture_postop(
     memcpy(&rec->word3, first + 12, 4);
 }
 
+static void dbg_v120_scan_f32(
+        const uint8_t * ptr, uint32_t nbytes,
+        uint32_t * nonfinite, uint32_t * maxabs_bits) {
+    uint32_t bad = 0;
+    float maxabs = 0.0f;
+    const uint32_t n = nbytes / 4u;
+    for (uint32_t i = 0; i < n; ++i) {
+        float v = 0.0f;
+        memcpy(&v, ptr + i * 4u, 4);
+        if (!isfinite(v)) {
+            bad++;
+        } else {
+            const float av = fabsf(v);
+            if (av > maxabs) maxabs = av;
+        }
+    }
+    union { float f; uint32_t u; } u;
+    u.f = maxabs;
+    *nonfinite = bad;
+    *maxabs_bits = u.u;
+}
+
+static void dbg_v120_capture_mmid_slices(
+        struct htp_mmid_slice_trace_record * recs,
+        uint32_t * out_count,
+        const struct htp_op_desc * op,
+        struct htp_tensor * tens,
+        bool capture_dst) {
+    if (!op || op->opcode != HTP_OP_MUL_MAT_ID ||
+        op->src[1] == 0xffff || op->src[2] == 0xffff ||
+        op->dst[0] == 0xffff) {
+        return;
+    }
+
+    struct htp_tensor * src1 = &tens[op->src[1]];
+    struct htp_tensor * ids  = &tens[op->src[2]];
+    struct htp_tensor * dst  = &tens[op->dst[0]];
+
+    uint32_t nslices = dst->ne[2] * dst->ne[3];
+    if (nslices == 0) nslices = 1;
+    nslices = MIN(nslices, (uint32_t) HTP_MMID_SLICE_TRACE_MAX);
+    *out_count = nslices;
+
+    for (uint32_t si = 0; si < nslices; ++si) {
+        struct htp_mmid_slice_trace_record * r = &recs[si];
+
+        if (!capture_dst) {
+            memset(r, 0, sizeof(*r));
+            r->valid = 1;
+            r->slice = si;
+
+            r->src1_ne0=src1->ne[0]; r->src1_ne1=src1->ne[1];
+            r->src1_ne2=src1->ne[2]; r->src1_ne3=src1->ne[3];
+            r->src1_nb0=src1->nb[0]; r->src1_nb1=src1->nb[1];
+            r->src1_nb2=src1->nb[2]; r->src1_nb3=src1->nb[3];
+
+            const uint32_t z2 = src1->ne[2] > 1 ? (si % src1->ne[2]) : 0u;
+            const uint32_t z3 = src1->ne[3] > 1 ? (si / MAX(src1->ne[2], 1u)) : 0u;
+            const uint8_t * sp = (const uint8_t *)(uintptr_t)src1->data +
+                (size_t)z2 * src1->nb[2] + (size_t)z3 * src1->nb[3];
+
+            uint32_t sbytes = src1->ne[2] > 1 ? src1->nb[2] : src1->size;
+            sbytes = MIN(sbytes, src1->size);
+            r->src1_hash_bytes = MIN(sbytes, 4096u);
+            r->src1_hash = dbg_v119_fnv1a(sp, r->src1_hash_bytes);
+
+            uint8_t first[16] = {0};
+            memcpy(first, sp, MIN(sbytes, 16u));
+            memcpy(&r->src1_word0, first+0, 4);
+            memcpy(&r->src1_word1, first+4, 4);
+            memcpy(&r->src1_word2, first+8, 4);
+            memcpy(&r->src1_word3, first+12, 4);
+
+            if (src1->type == HTP_TYPE_F32) {
+                dbg_v120_scan_f32(sp, sbytes,
+                    &r->src1_nonfinite, &r->src1_maxabs_bits);
+            }
+
+            r->ids_ne0=ids->ne[0]; r->ids_ne1=ids->ne[1];
+            r->ids_nb0=ids->nb[0]; r->ids_nb1=ids->nb[1];
+
+            int32_t * slots[8] = {
+                &r->ids0,&r->ids1,&r->ids2,&r->ids3,
+                &r->ids4,&r->ids5,&r->ids6,&r->ids7
+            };
+            for (uint32_t ii=0; ii<8u; ++ii) *slots[ii] = -9999;
+
+            const uint32_t idrow = ids->ne[1] > 1 ? MIN(si, ids->ne[1]-1u) : 0u;
+            const uint8_t * idbase = (const uint8_t *)(uintptr_t)ids->data +
+                (size_t)idrow * ids->nb[1];
+            const uint32_t nid = MIN(ids->ne[0], 8u);
+
+            for (uint32_t ii=0; ii<nid; ++ii) {
+                int32_t v = 0;
+                memcpy(&v, idbase + (size_t)ii * ids->nb[0], sizeof(v));
+                *slots[ii] = v;
+            }
+        } else {
+            r->dst_ne0=dst->ne[0]; r->dst_ne1=dst->ne[1];
+            r->dst_ne2=dst->ne[2]; r->dst_ne3=dst->ne[3];
+            r->dst_nb0=dst->nb[0]; r->dst_nb1=dst->nb[1];
+            r->dst_nb2=dst->nb[2]; r->dst_nb3=dst->nb[3];
+
+            const uint32_t z2 = dst->ne[2] > 1 ? (si % dst->ne[2]) : 0u;
+            const uint32_t z3 = dst->ne[3] > 1 ? (si / MAX(dst->ne[2], 1u)) : 0u;
+            const uint8_t * dp = (const uint8_t *)(uintptr_t)dst->data +
+                (size_t)z2 * dst->nb[2] + (size_t)z3 * dst->nb[3];
+
+            uint32_t dbytes = dst->ne[2] > 1 ? dst->nb[2] : dst->size;
+            dbytes = MIN(dbytes, dst->size);
+            r->dst_hash_bytes = MIN(dbytes, 4096u);
+            r->dst_hash = dbg_v119_fnv1a(dp, r->dst_hash_bytes);
+
+            uint8_t first[16] = {0};
+            memcpy(first, dp, MIN(dbytes, 16u));
+            memcpy(&r->dst_word0, first+0, 4);
+            memcpy(&r->dst_word1, first+4, 4);
+            memcpy(&r->dst_word2, first+8, 4);
+            memcpy(&r->dst_word3, first+12, 4);
+
+            if (dst->type == HTP_TYPE_F32) {
+                dbg_v120_scan_f32(dp, dbytes,
+                    &r->dst_nonfinite, &r->dst_maxabs_bits);
+            }
+        }
+    }
+}
+
 static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
     dspqueue_t queue = ctx->dsp_queue;
     int err;
@@ -1136,13 +1264,36 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     uint32_t dbg_trace_count = 0;
     struct htp_postop_trace_record dbg_trace[HTP_POSTOP_TRACE_MAX_RECORDS];
     memset(dbg_trace, 0, sizeof(dbg_trace));
+    uint32_t dbg_mmid_slice_count = 0;
+    bool dbg_mmid_slice_captured = false;
+    struct htp_mmid_slice_trace_record dbg_mmid_slice[HTP_MMID_SLICE_TRACE_MAX];
+    memset(dbg_mmid_slice, 0, sizeof(dbg_mmid_slice));
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
 
         profile_start(ctx->profiler, &prof);
 
+        const bool dbg_v120_target =
+            !dbg_mmid_slice_captured &&
+            ops[i].opcode == HTP_OP_MUL_MAT_ID &&
+            (uint32_t)ops[i].kernel_params[HTP_POSTOP_TRACE_WORD_MAGIC] ==
+                HTP_POSTOP_TRACE_MAGIC;
+
+        if (dbg_v120_target) {
+            dbg_v120_capture_mmid_slices(
+                dbg_mmid_slice, &dbg_mmid_slice_count,
+                &ops[i], tens, false);
+        }
+
         op_status = proc_op_req(octx, tens, i, &ops[i]);
+
+        if (dbg_v120_target && op_status == HTP_STATUS_OK) {
+            dbg_v120_capture_mmid_slices(
+                dbg_mmid_slice, &dbg_mmid_slice_count,
+                &ops[i], tens, true);
+            dbg_mmid_slice_captured = true;
+        }
 
         if (op_status == HTP_STATUS_OK &&
             dbg_trace_count < HTP_POSTOP_TRACE_MAX_RECORDS &&
@@ -1288,6 +1439,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
     rsp.dbg_trace_count = dbg_trace_count;
     memcpy(rsp.dbg_trace, dbg_trace, sizeof(dbg_trace));
+    rsp.dbg_mmid_slice_count = dbg_mmid_slice_count;
+    memcpy(rsp.dbg_mmid_slice, dbg_mmid_slice, sizeof(dbg_mmid_slice));
     rsp.dbg_full_ref_bits = dbg_full_ref_bits;
     memcpy(rsp.dbg_q8_actual, dbg_q8_actual, sizeof(dbg_q8_actual));
     memcpy(rsp.dbg_q8_scalar, dbg_q8_scalar, sizeof(dbg_q8_scalar));

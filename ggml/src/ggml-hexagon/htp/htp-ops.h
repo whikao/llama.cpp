@@ -126,6 +126,9 @@ enum htp_op_code {
 #define HTP_POSTOP_TRACE_WORD_ORDINAL   121
 #define HTP_POSTOP_TRACE_MAX_RECORDS    8
 
+// v10.20: detailed MUL_MAT_ID slice diagnostics for ne2/batch problems.
+#define HTP_MMID_SLICE_TRACE_MAX        10
+
 
 #define HTP_OP_MAX_BUFS    16
 #define HTP_OP_MAX_TENSORS 8192 // must stay under 64K (uint16)
@@ -260,6 +263,26 @@ struct htp_postop_trace_record {
     uint32_t ne3;
 };
 
+struct htp_mmid_slice_trace_record {
+    uint32_t valid;
+    uint32_t slice;
+
+    uint32_t src1_ne0, src1_ne1, src1_ne2, src1_ne3;
+    uint32_t src1_nb0, src1_nb1, src1_nb2, src1_nb3;
+    uint32_t src1_hash, src1_hash_bytes;
+    uint32_t src1_word0, src1_word1, src1_word2, src1_word3;
+    uint32_t src1_nonfinite, src1_maxabs_bits;
+
+    uint32_t ids_ne0, ids_ne1, ids_nb0, ids_nb1;
+    int32_t ids0, ids1, ids2, ids3, ids4, ids5, ids6, ids7;
+
+    uint32_t dst_ne0, dst_ne1, dst_ne2, dst_ne3;
+    uint32_t dst_nb0, dst_nb1, dst_nb2, dst_nb3;
+    uint32_t dst_hash, dst_hash_bytes;
+    uint32_t dst_word0, dst_word1, dst_word2, dst_word3;
+    uint32_t dst_nonfinite, dst_maxabs_bits;
+};
+
 struct htp_opbatch_rsp {
     uint32_t id;         // Batch id
     uint32_t status;     // HTP_STATUS_...
@@ -334,6 +357,8 @@ struct htp_opbatch_rsp {
     // v10.19: up to 8 consecutive post-op checkpoints.
     uint32_t dbg_trace_count;
     struct htp_postop_trace_record dbg_trace[HTP_POSTOP_TRACE_MAX_RECORDS];
+    uint32_t dbg_mmid_slice_count;
+    struct htp_mmid_slice_trace_record dbg_mmid_slice[HTP_MMID_SLICE_TRACE_MAX];
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
