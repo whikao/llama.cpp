@@ -296,18 +296,13 @@ struct htp_opbatch_rsp {
     // v10.14: row-0 integer accumulator produced by the exact HVX
     // accum_4bit_32x1() path for the selected single tile.
     int32_t dbg_hvx_int_dot;
+    uint32_t dbg_full_ref_bits;
 
     // v10.15: element-wise selected-tile diagnostics.
     int8_t  dbg_q8_actual[32];
     int8_t  dbg_q8_scalar[32];
     int8_t  dbg_q4_weight[32];
     int16_t dbg_prod_delta[32];
-
-    // v10.17: 8 exact vrmpy groups.
-    int32_t  dbg_vrmpy_actual[8];
-    int32_t  dbg_vrmpy_manual[8];
-    uint32_t dbg_vrmpy_w4[8];
-    uint32_t dbg_vrmpy_a4[8];
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };

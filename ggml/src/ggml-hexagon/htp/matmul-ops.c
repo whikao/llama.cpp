@@ -119,17 +119,14 @@ struct htp_mm_context {
     // v10.14.1: exact row-0 integer accumulator from accum_4bit_32x1().
     int32_t dbg_v114_hvx_int_dot;
 
+    // v10.18: full-K row-0 reference using the exact v10.16 Q8 quantizer replay.
+    uint32_t dbg_v118_full_ref_bits;
+
     // v10.15: selected-tile element diagnostics.
     int8_t  dbg_v115_q8_actual[32];
     int8_t  dbg_v115_q8_scalar[32];
     int8_t  dbg_v115_q4_weight[32];
     int16_t dbg_v115_prod_delta[32];
-
-    // v10.17: per-vrmpy exact-byte probe.
-    int32_t  dbg_v117_vrmpy_actual[8];
-    int32_t  dbg_v117_vrmpy_manual[8];
-    uint32_t dbg_v117_vrmpy_w4[8];
-    uint32_t dbg_v117_vrmpy_a4[8];
 
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
@@ -1486,130 +1483,6 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     const uint8_t * dbg_atile =
                         src1_col + (size_t) dbg_tile_idx * HTP_MM_ACT_TILE_SIZE_Q8_0;
 
-                    // v10.17: clone the current official
-                    // accum_4bit_32x1() loop and expose all 8 vrmpy groups.
-                    // Each group's "manual" value is computed from the exact
-                    // four signed weight/activation bytes consumed by the
-                    // corresponding Q6_Vw_vrmpyacc_VwVbVb instruction.
-                    {
-                        const HVX_Vector * svptr =
-                            (const HVX_Vector *) dbg_wtile;
-                        const HVX_Vector * svact =
-                            (const HVX_Vector *) dbg_atile;
-                        HVX_Vector si8 =
-                            Q6_Vb_vsplat_R(8);
-                        HVX_Vector smask_h4 =
-                            Q6_Vb_vsplat_R(0x0F);
-                        HVX_Vector ssum0 =
-                            Q6_V_vzero();
-                        HVX_Vector ssum1 =
-                            Q6_V_vzero();
-
-                        for (uint32_t si = 0;
-                             si < 4u; ++si) {
-                            HVX_VectorPair sw_pair =
-                                unpack_and_interleave_4bit_x2(
-                                    svptr[si],
-                                    smask_h4);
-                            HVX_Vector sw0 =
-                                Q6_Vb_vsub_VbVb(
-                                    Q6_V_lo_W(sw_pair),
-                                    si8);
-                            HVX_Vector sw1 =
-                                Q6_Vb_vsub_VbVb(
-                                    Q6_V_hi_W(sw_pair),
-                                    si8);
-                            HVX_Vector sa0 =
-                                svact[si * 2u + 0u];
-                            HVX_Vector sa1 =
-                                svact[si * 2u + 1u];
-
-                            int8_t sw0_b[128]
-                                __attribute__((aligned(128)));
-                            int8_t sw1_b[128]
-                                __attribute__((aligned(128)));
-                            int8_t sa0_b[128]
-                                __attribute__((aligned(128)));
-                            int8_t sa1_b[128]
-                                __attribute__((aligned(128)));
-                            hvx_vec_store_u(
-                                sw0_b, 128, sw0);
-                            hvx_vec_store_u(
-                                sw1_b, 128, sw1);
-                            hvx_vec_store_u(
-                                sa0_b, 128, sa0);
-                            hvx_vec_store_u(
-                                sa1_b, 128, sa1);
-
-                            int32_t old0[32]
-                                __attribute__((aligned(128)));
-                            int32_t old1[32]
-                                __attribute__((aligned(128)));
-                            hvx_vec_store_u(
-                                old0, 128, ssum0);
-                            hvx_vec_store_u(
-                                old1, 128, ssum1);
-
-                            HVX_Vector nsum0 =
-                                Q6_Vw_vrmpyacc_VwVbVb(
-                                    ssum0, sw0, sa0);
-                            HVX_Vector nsum1 =
-                                Q6_Vw_vrmpyacc_VwVbVb(
-                                    ssum1, sw1, sa1);
-
-                            int32_t new0[32]
-                                __attribute__((aligned(128)));
-                            int32_t new1[32]
-                                __attribute__((aligned(128)));
-                            hvx_vec_store_u(
-                                new0, 128, nsum0);
-                            hvx_vec_store_u(
-                                new1, 128, nsum1);
-
-                            const uint32_t g0 =
-                                si * 2u + 0u;
-                            const uint32_t g1 =
-                                si * 2u + 1u;
-
-                            mmctx->dbg_v117_vrmpy_actual[g0] =
-                                new0[0] - old0[0];
-                            mmctx->dbg_v117_vrmpy_actual[g1] =
-                                new1[0] - old1[0];
-
-                            int32_t manual0 = 0;
-                            int32_t manual1 = 0;
-                            for (uint32_t bj = 0;
-                                 bj < 4u; ++bj) {
-                                manual0 +=
-                                    (int32_t) sw0_b[bj] *
-                                    (int32_t) sa0_b[bj];
-                                manual1 +=
-                                    (int32_t) sw1_b[bj] *
-                                    (int32_t) sa1_b[bj];
-                            }
-                            mmctx->dbg_v117_vrmpy_manual[g0] =
-                                manual0;
-                            mmctx->dbg_v117_vrmpy_manual[g1] =
-                                manual1;
-
-                            memcpy(
-                                &mmctx->dbg_v117_vrmpy_w4[g0],
-                                sw0_b, 4);
-                            memcpy(
-                                &mmctx->dbg_v117_vrmpy_w4[g1],
-                                sw1_b, 4);
-                            memcpy(
-                                &mmctx->dbg_v117_vrmpy_a4[g0],
-                                sa0_b, 4);
-                            memcpy(
-                                &mmctx->dbg_v117_vrmpy_a4[g1],
-                                sa1_b, 4);
-
-                            ssum0 = nsum0;
-                            ssum1 = nsum1;
-                        }
-                    }
-
                     // Run the exact integer helper used by the official kernel.
                     // This deliberately avoids any scalar reconstruction of the
                     // tiled lane permutation.
@@ -1831,6 +1704,117 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     mmctx->dbg_v111_scales_fp16  =
                         (uint32_t) q4s_u16 |
                         ((uint32_t) q8s_u16 << 16);
+
+                    // v10.18: full-K exact reference for row 0.
+                    // For every 128 activation values, replay the same
+                    // HVX/F16 Q8 quantizer arithmetic validated by v10.16.
+                    float dbg_full_ref = 0.0f;
+                    for (uint32_t gbase = 0; gbase < ne10; gbase += 128u) {
+                        const uint32_t gcount = MIN(128u, ne10 - gbase);
+
+                        float gx[128] __attribute__((aligned(128)));
+                        memset(gx, 0, sizeof(gx));
+                        for (uint32_t qi = 0; qi < gcount; ++qi) {
+                            memcpy(&gx[qi],
+                                src1_orig_bytes +
+                                    (size_t) (gbase + qi) * nb10,
+                                sizeof(float));
+                        }
+
+                        HVX_Vector * gvx = (HVX_Vector *) gx;
+                        HVX_Vector gzero = Q6_V_vzero();
+
+                        HVX_Vector gvx0_qf =
+                            Q6_Vqf32_vsub_VsfVsf(gvx[0], gzero);
+                        HVX_Vector gvx1_qf =
+                            Q6_Vqf32_vsub_VsfVsf(gvx[1], gzero);
+                        HVX_Vector gvx2_qf =
+                            Q6_Vqf32_vsub_VsfVsf(gvx[2], gzero);
+                        HVX_Vector gvx3_qf =
+                            Q6_Vqf32_vsub_VsfVsf(gvx[3], gzero);
+
+                        HVX_Vector gvx01_hf =
+                            Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(
+                                Q6_W_vcombine_VV(gvx1_qf, gvx0_qf)));
+                        HVX_Vector gvx23_hf =
+                            Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(
+                                Q6_W_vcombine_VV(gvx3_qf, gvx2_qf)));
+
+                        HVX_Vector gvmax_hf =
+                            hvx_vec_reduce_max_f16(
+                                hvx_vec_abs_f16(gvx01_hf));
+                        gvmax_hf =
+                            hvx_vec_reduce_max2_f16(
+                                hvx_vec_abs_f16(gvx23_hf), gvmax_hf);
+
+                        HVX_Vector gvd_qf16 =
+                            Q6_Vqf16_vmpy_VhfVhf(
+                                gvmax_hf, Q6_Vh_vsplat_R(0x2008));
+                        HVX_Vector gvd_hf =
+                            Q6_Vhf_equals_Vqf16(gvd_qf16);
+                        HVX_Vector gvd_inv_hf =
+                            hvx_vec_inverse_f16(gvd_hf);
+
+                        gvx01_hf = Q6_Vhf_equals_Vqf16(
+                            Q6_Vqf16_vmpy_VhfVhf(
+                                gvx01_hf, gvd_inv_hf));
+                        gvx23_hf = Q6_Vhf_equals_Vqf16(
+                            Q6_Vqf16_vmpy_VhfVhf(
+                                gvx23_hf, gvd_inv_hf));
+
+                        HVX_Vector gvx01_i16 =
+                            hvx_vec_i16_from_hf_rnd_sat(gvx01_hf);
+                        HVX_Vector gvx23_i16 =
+                            hvx_vec_i16_from_hf_rnd_sat(gvx23_hf);
+                        HVX_Vector gvx_i8 =
+                            Q6_Vb_vpack_VhVh_sat(
+                                gvx23_i16, gvx01_i16);
+
+                        int8_t gq8[128] __attribute__((aligned(128)));
+                        hvx_vec_store_u(gq8, 128, gvx_i8);
+
+                        const uint32_t nsub = (gcount + 31u) / 32u;
+                        for (uint32_t sb = 0; sb < nsub; ++sb) {
+                            const uint32_t tile_idx = gbase / 32u + sb;
+                            const uint8_t * rq4 =
+                                raw_buf + (size_t) tile_idx * 18u;
+                            const uint8_t * rqs = rq4 + 2;
+
+                            uint16_t q4d_u16 = 0;
+                            memcpy(&q4d_u16, rq4, sizeof(q4d_u16));
+                            __fp16 q4d_h;
+                            memcpy(&q4d_h, &q4d_u16, sizeof(q4d_h));
+
+                            const uint8_t * qat =
+                                src1_col +
+                                (size_t) tile_idx * HTP_MM_ACT_TILE_SIZE_Q8_0;
+                            uint16_t q8d_u16 = 0;
+                            memcpy(&q8d_u16, qat + 1024, sizeof(q8d_u16));
+                            __fp16 q8d_h;
+                            memcpy(&q8d_h, &q8d_u16, sizeof(q8d_h));
+
+                            int32_t idot = 0;
+                            const uint32_t remain =
+                                MIN(32u, ne10 - tile_idx * 32u);
+                            for (uint32_t kli = 0; kli < remain; ++kli) {
+                                const int32_t qw =
+                                    (int32_t) htp_raw_q4_0_get_nibble(
+                                        rqs, kli) - 8;
+                                const int32_t qa =
+                                    (int32_t) gq8[sb * 32u + kli];
+                                idot += qw * qa;
+                            }
+
+                            dbg_full_ref +=
+                                (float) idot *
+                                (float) q4d_h *
+                                (float) q8d_h;
+                        }
+                    }
+
+                    union { float f; uint32_t u; } dbg_full_ref_u;
+                    dbg_full_ref_u.f = dbg_full_ref;
+                    mmctx->dbg_v118_full_ref_bits = dbg_full_ref_u.u;
 
                     // Word 31 was previously scales; keep it.  The new HVX
                     // integer dot is carried through an added response field
@@ -4547,17 +4531,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
             memcpy(&wd, &mmctx->dbg_v115_prod_delta[pi * 2u], 4);
             dbg_words[64 + pi] = (int32_t) wd;
         }
-        for (uint32_t gi = 0;
-             gi < 8u; ++gi) {
-            dbg_words[80 + gi] =
-                mmctx->dbg_v117_vrmpy_actual[gi];
-            dbg_words[88 + gi] =
-                mmctx->dbg_v117_vrmpy_manual[gi];
-            dbg_words[96 + gi] =
-                (int32_t) mmctx->dbg_v117_vrmpy_w4[gi];
-            dbg_words[104 + gi] =
-                (int32_t) mmctx->dbg_v117_vrmpy_a4[gi];
-        }
+        dbg_words[112] = (int32_t) mmctx->dbg_v118_full_ref_bits;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
