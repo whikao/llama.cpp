@@ -1194,6 +1194,9 @@ static inline uint8_t htp_raw_q4_0_get_nibble(const uint8_t * qs, uint32_t q) {
     return qs[q - 16] >> 4;
 }
 
+_Static_assert(HTP_MM_WEIGHT_TILE_SIZE_Q4_0 == 576, "unexpected Q4_0 logical tile size");
+_Static_assert(HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 == 640, "unexpected Q4_0 aligned tile stride");
+
 static void htp_raw_q4_0_32rows_to_tiled(
         const uint8_t * restrict raw,
         size_t raw_row_size,
@@ -1203,7 +1206,15 @@ static void htp_raw_q4_0_32rows_to_tiled(
     const uint32_t n_k_tiles = k / 32;
 
     for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
-        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_TILE_SIZE_Q4_0;
+        // v10.10 correctness fix:
+        // The Q4_0 dot kernel advances weight tiles at the aligned 640-byte
+        // stride, while this raw converter previously packed them every 576
+        // bytes. kt=0 therefore looked correct in our hashes, but kt>=1 was
+        // read from the wrong address.
+        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
+
+        // Logical Q4_0 data occupies 576 bytes; clear the 64-byte alignment tail.
+        memset(tile, 0, HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0);
 
         for (uint32_t cp = 0; cp < 16; ++cp) {
             for (uint32_t row = 0; row < 32; ++row) {
