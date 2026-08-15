@@ -71,7 +71,7 @@ enum htp_mm_kernel_type {
 };
 
 // Op-specific struct for precomputed matmul params
-#define HTP_MM_DEBUG_RETURN_MAGIC HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC /* v10.14: selected-tile exact HVX integer accumulator vs scalar logical-Q4/Q8 reference */
+#define HTP_MM_DEBUG_RETURN_MAGIC HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC /* v10.15: recover actual logical Q8 elements via official HVX basis probes and compare element-wise */
 
 struct htp_mm_kernel_params {
     int32_t  kernel_type;        // enum htp_mm_kernel_type

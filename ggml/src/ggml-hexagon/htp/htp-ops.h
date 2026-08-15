@@ -109,7 +109,7 @@ enum htp_op_code {
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
 // v10.12: preserve the original first 32 words and reserve 8 extra
 // Host -> DSP runtime MMID debug-control words.
-#define HTP_OP_MAX_KERN_PARAMS 40
+#define HTP_OP_MAX_KERN_PARAMS 176
 
 #define HTP_MM_DEBUG_CTRL_MAGIC 0x44423132u /* "DB12" */
 #define HTP_MM_DEBUG_CTRL_WORD_MAGIC   32
@@ -296,6 +296,12 @@ struct htp_opbatch_rsp {
     // v10.14: row-0 integer accumulator produced by the exact HVX
     // accum_4bit_32x1() path for the selected single tile.
     int32_t dbg_hvx_int_dot;
+
+    // v10.15: element-wise selected-tile diagnostics.
+    int8_t  dbg_q8_actual[32];
+    int8_t  dbg_q8_scalar[32];
+    int8_t  dbg_q4_weight[32];
+    int16_t dbg_prod_delta[32];
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };

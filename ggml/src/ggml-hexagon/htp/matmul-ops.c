@@ -119,6 +119,12 @@ struct htp_mm_context {
     // v10.14.1: exact row-0 integer accumulator from accum_4bit_32x1().
     int32_t dbg_v114_hvx_int_dot;
 
+    // v10.15: selected-tile element diagnostics.
+    int8_t  dbg_v115_q8_actual[32];
+    int8_t  dbg_v115_q8_scalar[32];
+    int8_t  dbg_v115_q4_weight[32];
+    int16_t dbg_v115_prod_delta[32];
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1554,6 +1560,77 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
                     const float scalar_ref =
                         (float) scalar_int_dot * (float) q4s_h * q8s_f;
+                    // v10.15: recover ACTUAL logical Q8[32] without
+                    // assuming tiled-memory lane order. Construct a synthetic
+                    // tiled Q4 tile where one logical weight is +1 and all
+                    // others are 0, then call the exact official
+                    // accum_4bit_32x1() helper. Its row-0 integer accumulator is
+                    // therefore exactly that logical Q8 element.
+                    //
+                    // The raw->tiled converter already defines the Q4 logical
+                    // placement, so use it to build each one-hot tile instead
+                    // of manually guessing nibble/lane permutation.
+                    uint8_t probe_raw[32 * 18] __attribute__((aligned(128)));
+                    uint8_t probe_tiled[HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0]
+                        __attribute__((aligned(128)));
+
+                    for (uint32_t kli = 0; kli < 32; ++kli) {
+                        // Actual logical Q4 weight for reporting.
+                        mmctx->dbg_v115_q4_weight[kli] =
+                            (int8_t) ((int32_t) htp_raw_q4_0_get_nibble(qs, kli) - 8);
+
+                        // Scalar-reconstructed Q8 for comparison.
+                        const uint32_t ki = dbg_tile_idx * 32u + kli;
+                        float xf = 0.0f;
+                        memcpy(&xf,
+                            src1_orig_bytes + (size_t) ki * nb10,
+                            sizeof(xf));
+                        const __fp16 xh = (__fp16) xf;
+                        int32_t qa_scalar = 0;
+                        if (q8s_f != 0.0f && isfinite(q8s_f)) {
+                            qa_scalar = (int32_t) roundf((float) xh / q8s_f);
+                            if (qa_scalar > 127)  qa_scalar = 127;
+                            if (qa_scalar < -128) qa_scalar = -128;
+                        }
+                        mmctx->dbg_v115_q8_scalar[kli] = (int8_t) qa_scalar;
+
+                        // Build 32 raw Q4 rows. Row 0 carries the one-hot vector;
+                        // rows 1..31 are all zero. Q4_0 zero is nibble 8.
+                        memset(probe_raw, 0, sizeof(probe_raw));
+                        for (uint32_t rr = 0; rr < 32; ++rr) {
+                            uint8_t * rb = probe_raw + rr * 18u;
+                            uint16_t one_scale = 0x3c00u; // fp16 1.0
+                            memcpy(rb, &one_scale, sizeof(one_scale));
+                            memset(rb + 2, 0x88, 16); // all logical q4 values = 0
+                        }
+
+                        // Set row0 logical index kli to +1 => nibble 9.
+                        uint8_t * row0_qs = probe_raw + 2;
+                        const uint32_t bi = kli >> 1;
+                        if ((kli & 1u) == 0) {
+                            row0_qs[bi] = (uint8_t) ((row0_qs[bi] & 0xf0u) | 0x09u);
+                        } else {
+                            row0_qs[bi] = (uint8_t) ((row0_qs[bi] & 0x0fu) | 0x90u);
+                        }
+
+                        memset(probe_tiled, 0, sizeof(probe_tiled));
+                        htp_raw_q4_0_32rows_to_tiled(probe_raw, probe_tiled, 32u, 32u);
+
+                        const HVX_Vector * pv = (const HVX_Vector *) probe_tiled;
+                        HVX_Vector one_sum =
+                            accum_4bit_32x1(pv, dbg_vact, dbg_i8);
+                        int32_t one_words[32] __attribute__((aligned(128)));
+                        hvx_vec_store_u(one_words, 128, one_sum);
+
+                        int32_t qa_actual = one_words[0];
+                        if (qa_actual > 127)  qa_actual = 127;
+                        if (qa_actual < -128) qa_actual = -128;
+                        mmctx->dbg_v115_q8_actual[kli] = (int8_t) qa_actual;
+
+                        const int32_t qw = (int32_t) mmctx->dbg_v115_q4_weight[kli];
+                        mmctx->dbg_v115_prod_delta[kli] =
+                            (int16_t) (qw * (qa_actual - qa_scalar));
+                    }
 
                     // Exact single-tile floating result from the official kernel.
                     float hvx_tile[32] __attribute__((aligned(128)));
@@ -4271,6 +4348,22 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_words[31] = (int32_t) mmctx->dbg_v111_scales_fp16;
         // v10.14: exact HVX integer accumulator, row 0, selected tile.
         dbg_words[16] = mmctx->dbg_v114_hvx_int_dot;
+
+        // v10.15 packed element diagnostics in debug-only kernel_params tail.
+        for (uint32_t pi = 0; pi < 8; ++pi) {
+            uint32_t wa = 0, ws = 0, wq = 0;
+            memcpy(&wa, &mmctx->dbg_v115_q8_actual[pi * 4u], 4);
+            memcpy(&ws, &mmctx->dbg_v115_q8_scalar[pi * 4u], 4);
+            memcpy(&wq, &mmctx->dbg_v115_q4_weight[pi * 4u], 4);
+            dbg_words[40 + pi] = (int32_t) wa;
+            dbg_words[48 + pi] = (int32_t) ws;
+            dbg_words[56 + pi] = (int32_t) wq;
+        }
+        for (uint32_t pi = 0; pi < 16; ++pi) {
+            uint32_t wd = 0;
+            memcpy(&wd, &mmctx->dbg_v115_prod_delta[pi * 2u], 4);
+            dbg_words[64 + pi] = (int32_t) wd;
+        }
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
