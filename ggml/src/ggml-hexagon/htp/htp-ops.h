@@ -242,7 +242,10 @@ struct htp_opbatch_rsp {
     uint32_t dbg_expert;     // selected expert id captured by DSP
     uint32_t dbg_src_off;    // expert * nb02 used by DSP
     uint32_t dbg_raw_fnv;    // FNV-1a of raw selected-expert working set
-    uint32_t dbg_tile_fnv;   // FNV-1a of first converted tiled Q4_0 tile
+    uint32_t dbg_tile_fnv;   // FNV-1a of converted tiled Q4_0 tile
+    uint32_t dbg_ct;         // exact 32-row tile index hashed by DSP
+    uint32_t dbg_ith;        // DSP worker thread that processed dbg_ct
+    uint32_t dbg_valid_rows; // valid rows in dbg_ct
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };

@@ -1044,8 +1044,11 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     uint32_t dbg_op_index = 0;
     uint32_t dbg_expert   = 0;
     uint32_t dbg_src_off  = 0;
-    uint32_t dbg_raw_fnv  = 0;
-    uint32_t dbg_tile_fnv = 0;
+    uint32_t dbg_raw_fnv    = 0;
+    uint32_t dbg_tile_fnv   = 0;
+    uint32_t dbg_ct         = 0;
+    uint32_t dbg_ith        = 0;
+    uint32_t dbg_valid_rows = 0;
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1062,10 +1065,13 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             (uint32_t) octx->kernel_params[0] == HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC) {
             dbg_magic    = HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC;
             dbg_op_index = i;
-            dbg_expert   = (uint32_t) octx->kernel_params[1];
-            dbg_raw_fnv  = (uint32_t) octx->kernel_params[2];
-            dbg_tile_fnv = (uint32_t) octx->kernel_params[3];
-            dbg_src_off  = (uint32_t) octx->kernel_params[4];
+            dbg_expert     = (uint32_t) octx->kernel_params[1];
+            dbg_raw_fnv     = (uint32_t) octx->kernel_params[2];
+            dbg_tile_fnv    = (uint32_t) octx->kernel_params[3];
+            dbg_src_off     = (uint32_t) octx->kernel_params[4];
+            dbg_ct          = (uint32_t) octx->kernel_params[5];
+            dbg_ith         = (uint32_t) octx->kernel_params[6];
+            dbg_valid_rows  = (uint32_t) octx->kernel_params[7];
         }
 
         profile_stop(ctx->profiler, &prof);
@@ -1109,8 +1115,11 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_op_index = dbg_op_index;
     rsp.dbg_expert   = dbg_expert;
     rsp.dbg_src_off  = dbg_src_off;
-    rsp.dbg_raw_fnv  = dbg_raw_fnv;
-    rsp.dbg_tile_fnv = dbg_tile_fnv;
+    rsp.dbg_raw_fnv    = dbg_raw_fnv;
+    rsp.dbg_tile_fnv   = dbg_tile_fnv;
+    rsp.dbg_ct         = dbg_ct;
+    rsp.dbg_ith        = dbg_ith;
+    rsp.dbg_valid_rows = dbg_valid_rows;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {

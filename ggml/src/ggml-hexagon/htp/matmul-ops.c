@@ -72,6 +72,9 @@ struct htp_mm_context {
     uint32_t dbg_v103_raw_fnv;
     uint32_t dbg_v103_tile_fnv;
     uint32_t dbg_v103_src_off;
+    uint32_t dbg_v106_ct;
+    uint32_t dbg_v106_ith;
+    uint32_t dbg_v106_valid_rows;
 
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
@@ -1257,7 +1260,10 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             // v10.3: capture the first selected expert into this op's mmctx.
             // The result is copied into the shared kernel_params blob only after all
             // worker threads finish, so it cannot disturb execution parameters.
-            if (__sync_bool_compare_and_swap(&mmctx->dbg_v103_claimed, 0, 1)) {
+            // v10.6: Host reference hashes ct=0 (rows 0..31), so only the
+            // DSP worker processing ct=0 may claim the debug slot.
+            if (ct == 0 &&
+                __sync_bool_compare_and_swap(&mmctx->dbg_v103_claimed, 0, 1)) {
                 const size_t raw_bytes = (size_t) valid_rows * raw_row_size;
 
                 uint32_t raw_fnv = 2166136261u;
@@ -1272,10 +1278,13 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     tile_fnv *= 16777619u;
                 }
 
-                mmctx->dbg_v103_expert   = cur_a;
-                mmctx->dbg_v103_raw_fnv  = raw_fnv;
-                mmctx->dbg_v103_tile_fnv = tile_fnv;
-                mmctx->dbg_v103_src_off  = cur_a * nb02;
+                mmctx->dbg_v103_expert     = cur_a;
+                mmctx->dbg_v103_raw_fnv    = raw_fnv;
+                mmctx->dbg_v103_tile_fnv   = tile_fnv;
+                mmctx->dbg_v103_src_off    = cur_a * nb02;
+                mmctx->dbg_v106_ct         = ct;
+                mmctx->dbg_v106_ith        = ith;
+                mmctx->dbg_v106_valid_rows = valid_rows;
             }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -3907,11 +3916,14 @@ int op_matmul_id(struct htp_ops_context * octx) {
 
         // The op has finished, so these execution fields are dead. Reuse five int32 slots
         // as a tiny DSP->host return channel without changing the fixed 128-byte ABI.
-        dbg_kparams->kernel_type = (int32_t) HTP_MM_DEBUG_RETURN_MAGIC;
-        dbg_kparams->pipeline    = (int32_t) mmctx->dbg_v103_expert;
-        dbg_kparams->m_chunk     = (int32_t) mmctx->dbg_v103_raw_fnv;
-        dbg_kparams->n_chunk     = (int32_t) mmctx->dbg_v103_tile_fnv;
-        dbg_kparams->n_threads   = (int32_t) mmctx->dbg_v103_src_off;
+        dbg_kparams->kernel_type   = (int32_t) HTP_MM_DEBUG_RETURN_MAGIC;
+        dbg_kparams->pipeline      = (int32_t) mmctx->dbg_v103_expert;
+        dbg_kparams->m_chunk       = (int32_t) mmctx->dbg_v103_raw_fnv;
+        dbg_kparams->n_chunk       = (int32_t) mmctx->dbg_v103_tile_fnv;
+        dbg_kparams->n_threads     = (int32_t) mmctx->dbg_v103_src_off;
+        dbg_kparams->n_act_threads = (int32_t) mmctx->dbg_v106_ct;
+        dbg_kparams->n_hmx         = (int32_t) mmctx->dbg_v106_ith;
+        dbg_kparams->n_prefetch    = (int32_t) mmctx->dbg_v106_valid_rows;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
