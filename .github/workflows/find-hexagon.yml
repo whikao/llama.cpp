@@ -1,0 +1,52 @@
+name: Find Hexagon Symbols
+
+on:
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find HTP response and DSP queue code
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "1. htp_opbatch_rsp / dspqueue_write"
+          echo "========================================"
+
+          grep -R -n -E \
+            'htp_opbatch_rsp|dspqueue_write' \
+            ggml/src/ggml-hexagon || true
+
+          echo
+          echo "========================================"
+          echo "2. Find htp-ops.h"
+          echo "========================================"
+
+          find ggml/src/ggml-hexagon \
+            -type f \
+            -name 'htp-ops.h' \
+            -print
+
+          echo
+          echo "========================================"
+          echo "3. Search related opbatch symbols"
+          echo "========================================"
+
+          grep -R -n -E \
+            'opbatch|dspqueue_read|dspqueue_write' \
+            ggml/src/ggml-hexagon || true
+
+          echo
+          echo "========================================"
+          echo "4. All Hexagon source files"
+          echo "========================================"
+
+          find ggml/src/ggml-hexagon \
+            -maxdepth 2 \
+            -type f \
+            | sort
