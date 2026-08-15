@@ -75,6 +75,78 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
 static int    opt_mmid_raw_q4_0 = 0; // EXPERIMENTAL: keep Q4_0 MUL_MAT_ID weights on host; scheduler stages raw copies
 
+// v10.12 runtime MMID debug driver. Change these environment variables between
+// runs; no rebuild is required.
+struct ggml_hexagon_mmid_debug_cfg {
+    bool enabled = false;
+    int32_t expert = -1; // -1 = first selected expert in the targeted op
+    int32_t ct = 0;
+    int32_t cid = 0;
+    int32_t k = 32;
+    std::string tensor_substr;
+};
+
+static const ggml_hexagon_mmid_debug_cfg & ggml_hexagon_mmid_debug_cfg_get() {
+    static const ggml_hexagon_mmid_debug_cfg cfg = []() {
+        ggml_hexagon_mmid_debug_cfg c;
+        const char * e = std::getenv("GGML_HEXAGON_MMID_DEBUG");
+        c.enabled = e && std::strcmp(e, "0") != 0 && e[0] != '\0';
+        if (!c.enabled) {
+            return c;
+        }
+
+        auto read_i32 = [](const char * name, int32_t def) {
+            const char * v = std::getenv(name);
+            if (!v || !*v) return def;
+            char * end = nullptr;
+            long x = std::strtol(v, &end, 0);
+            return (end && *end == '\0') ? (int32_t) x : def;
+        };
+
+        c.expert = read_i32("GGML_HEXAGON_DEBUG_EXPERT", -1);
+        c.ct     = read_i32("GGML_HEXAGON_DEBUG_CT", 0);
+        c.cid    = read_i32("GGML_HEXAGON_DEBUG_CID", 0);
+        c.k      = read_i32("GGML_HEXAGON_DEBUG_K", 32);
+        if (c.ct < 0) c.ct = 0;
+        if (c.cid < 0) c.cid = 0;
+        if (c.k < 32) c.k = 32;
+        c.k = (c.k / 32) * 32;
+
+        const char * t = std::getenv("GGML_HEXAGON_DEBUG_TENSOR");
+        if (t) c.tensor_substr = t;
+        return c;
+    }();
+    return cfg;
+}
+
+static void ggml_hexagon_apply_mmid_debug_ctrl(htp_opnode & node) {
+    const auto & cfg = ggml_hexagon_mmid_debug_cfg_get();
+    if (!cfg.enabled || node.opcode != HTP_OP_MUL_MAT_ID || !node.node || !node.node->src[0]) {
+        return;
+    }
+
+    const char * name = node.node->src[0]->name;
+    if (!cfg.tensor_substr.empty() &&
+        (!name || std::strstr(name, cfg.tensor_substr.c_str()) == nullptr)) {
+        return;
+    }
+
+    auto * kp = (struct htp_mm_kernel_params *) node.kernel_params;
+    if (kp->kernel_type != HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0) {
+        return;
+    }
+
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_MAGIC]  = (int32_t) HTP_MM_DEBUG_CTRL_MAGIC;
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_EXPERT] = cfg.expert;
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_CT]     = cfg.ct;
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_CID]    = cfg.cid;
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_K]      = cfg.k;
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_FLAGS]  = 1;
+
+    GGML_LOG_INFO("DBG_V112_CONFIG: tensor=%s expert=%d ct=%d cid=%d k=%d\n",
+        name ? name : "<null>", cfg.expert, cfg.ct, cfg.cid, cfg.k);
+}
+
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 
@@ -1788,14 +1860,15 @@ struct ggml_hexagon_opqueue {
                 const uint32_t q8_scale_fp16 =
                     rsp.dbg_k32_scales_fp16 >> 16;
                 GGML_LOG_INFO(
-                    "DBG_V111_K32_REF: dev=%s batch=%u op=%u expert=%u ct=%u "
-                    "hvx_k32=%g ref_k32=%g hvx_bits=%08x ref_bits=%08x "
-                    "int_dot=%d q4_scale_fp16=%04x q8_scale_fp16=%04x\n",
+                    "DBG_V112_K_REF: dev=%s batch=%u op=%u expert=%u ct=%u k=%u "
+                    "hvx=%g ref=%g hvx_bits=%08x ref_bits=%08x "
+                    "first_int_dot=%d q4_scale0_fp16=%04x q8_scale0_fp16=%04x\n",
                     shm_buf->sess->c_name(),
                     rsp.id,
                     rsp.dbg_op_index,
                     rsp.dbg_expert,
                     rsp.dbg_ct,
+                    rsp.dbg_runtime_k,
                     hk.f,
                     rk.f,
                     rsp.dbg_hvx_k32_bits,
@@ -4047,6 +4120,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     node.node->src[0], node.node->src[1], node.node,
                     (struct htp_mm_kernel_params *)node.kernel_params
                 );
+                ggml_hexagon_apply_mmid_debug_ctrl(node);
             } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
                 ggml_hexagon_precompute_flash_attn_params(sess,
                     node.node,
