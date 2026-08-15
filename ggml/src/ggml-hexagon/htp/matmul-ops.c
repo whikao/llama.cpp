@@ -1614,7 +1614,7 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                         }
 
                         memset(probe_tiled, 0, sizeof(probe_tiled));
-                        htp_raw_q4_0_32rows_to_tiled(probe_raw, probe_tiled, 32u, 32u);
+                        htp_raw_q4_0_32rows_to_tiled(probe_raw, 18u, probe_tiled, 32u, 32u);
 
                         const HVX_Vector * pv = (const HVX_Vector *) probe_tiled;
                         HVX_Vector one_sum =
