@@ -116,6 +116,9 @@ struct htp_mm_context {
     uint32_t dbg_v112_want_cid;
     uint32_t dbg_v112_want_k;
 
+    // v10.14.1: exact row-0 integer accumulator from accum_4bit_32x1().
+    int32_t dbg_v114_hvx_int_dot;
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1572,7 +1575,7 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     // Word 31 was previously scales; keep it.  The new HVX
                     // integer dot is carried through an added response field
                     // populated from a spare debug word below.
-                    mmctx->dbg_v112_actual_k = (uint32_t) dbg_hvx_int_dot;
+                    mmctx->dbg_v114_hvx_int_dot = dbg_hvx_int_dot;
                 }
 
                 tiled_vec_dot_q4_0_32x1(
@@ -4267,7 +4270,7 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_words[30] = (int32_t) mmctx->dbg_v111_int_dot;
         dbg_words[31] = (int32_t) mmctx->dbg_v111_scales_fp16;
         // v10.14: exact HVX integer accumulator, row 0, selected tile.
-        dbg_words[16] = (int32_t) mmctx->dbg_v112_actual_k;
+        dbg_words[16] = mmctx->dbg_v114_hvx_int_dot;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
