@@ -71,7 +71,7 @@ enum htp_mm_kernel_type {
 };
 
 // Op-specific struct for precomputed matmul params
-#define HTP_MM_DEBUG_RETURN_MAGIC HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC /* v10.15: recover actual logical Q8 elements via official HVX basis probes and compare element-wise */
+#define HTP_MM_DEBUG_RETURN_MAGIC HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC /* v10.16: replay official Q8 quantizer arithmetic before vdelta and compare element-wise */
 
 struct htp_mm_kernel_params {
     int32_t  kernel_type;        // enum htp_mm_kernel_type

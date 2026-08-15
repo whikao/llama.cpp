@@ -1560,76 +1560,129 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
                     const float scalar_ref =
                         (float) scalar_int_dot * (float) q4s_h * q8s_f;
-                    // v10.15: recover ACTUAL logical Q8[32] without
-                    // assuming tiled-memory lane order. Construct a synthetic
-                    // tiled Q4 tile where one logical weight is +1 and all
-                    // others are 0, then call the exact official
-                    // accum_4bit_32x1() helper. Its row-0 integer accumulator is
-                    // therefore exactly that logical Q8 element.
+                    // v10.16: replay the current official
+                    // quantize_block_f32_q8_0_tiled() arithmetic up to vx_i8,
+                    // BEFORE vdelta lays it out into tiled activation memory.
                     //
-                    // The raw->tiled converter already defines the Q4 logical
-                    // placement, so use it to build each one-hot tile instead
-                    // of manually guessing nibble/lane permutation.
-                    uint8_t probe_raw[32 * 18] __attribute__((aligned(128)));
-                    uint8_t probe_tiled[HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0]
+                    // This removes scalar division/roundf from "q8_quant":
+                    // F32 -> qf32 -> F16 -> max(abs) -> d=max/127 (F16)
+                    // -> F16 reciprocal -> F16 multiply -> rnd/sat i16 -> i8.
+                    const uint32_t q8_group_base =
+                        (dbg_tile_idx / 4u) * 128u;
+                    const uint32_t q8_subblock =
+                        dbg_tile_idx % 4u;
+
+                    float q8_replay_x[128]
                         __attribute__((aligned(128)));
+                    for (uint32_t qi = 0; qi < 128u; ++qi) {
+                        memcpy(&q8_replay_x[qi],
+                            src1_orig_bytes +
+                                (size_t) (q8_group_base + qi) * nb10,
+                            sizeof(float));
+                    }
 
-                    for (uint32_t kli = 0; kli < 32; ++kli) {
-                        // Actual logical Q4 weight for reporting.
-                        mmctx->dbg_v115_q4_weight[kli] =
-                            (int8_t) ((int32_t) htp_raw_q4_0_get_nibble(qs, kli) - 8);
+                    HVX_Vector * qvx =
+                        (HVX_Vector *) q8_replay_x;
+                    HVX_Vector qzero = Q6_V_vzero();
 
-                        // Scalar-reconstructed Q8 for comparison.
-                        const uint32_t ki = dbg_tile_idx * 32u + kli;
+                    HVX_Vector qvx0_qf =
+                        Q6_Vqf32_vsub_VsfVsf(qvx[0], qzero);
+                    HVX_Vector qvx1_qf =
+                        Q6_Vqf32_vsub_VsfVsf(qvx[1], qzero);
+                    HVX_Vector qvx2_qf =
+                        Q6_Vqf32_vsub_VsfVsf(qvx[2], qzero);
+                    HVX_Vector qvx3_qf =
+                        Q6_Vqf32_vsub_VsfVsf(qvx[3], qzero);
+
+                    HVX_Vector qvx01_hf =
+                        Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(
+                            Q6_W_vcombine_VV(qvx1_qf, qvx0_qf)));
+                    HVX_Vector qvx23_hf =
+                        Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(
+                            Q6_W_vcombine_VV(qvx3_qf, qvx2_qf)));
+
+                    HVX_Vector qvmax_hf =
+                        hvx_vec_reduce_max_f16(
+                            hvx_vec_abs_f16(qvx01_hf));
+                    qvmax_hf =
+                        hvx_vec_reduce_max2_f16(
+                            hvx_vec_abs_f16(qvx23_hf),
+                            qvmax_hf);
+
+                    HVX_Vector qvd_qf16 =
+                        Q6_Vqf16_vmpy_VhfVhf(
+                            qvmax_hf,
+                            Q6_Vh_vsplat_R(0x2008));
+                    HVX_Vector qvd_hf =
+                        Q6_Vhf_equals_Vqf16(qvd_qf16);
+                    HVX_Vector qvd_inv_hf =
+                        hvx_vec_inverse_f16(qvd_hf);
+
+                    qvx01_hf =
+                        Q6_Vhf_equals_Vqf16(
+                            Q6_Vqf16_vmpy_VhfVhf(
+                                qvx01_hf, qvd_inv_hf));
+                    qvx23_hf =
+                        Q6_Vhf_equals_Vqf16(
+                            Q6_Vqf16_vmpy_VhfVhf(
+                                qvx23_hf, qvd_inv_hf));
+
+                    HVX_Vector qvx01_i16 =
+                        hvx_vec_i16_from_hf_rnd_sat(
+                            qvx01_hf);
+                    HVX_Vector qvx23_i16 =
+                        hvx_vec_i16_from_hf_rnd_sat(
+                            qvx23_hf);
+                    HVX_Vector qvx_i8 =
+                        Q6_Vb_vpack_VhVh_sat(
+                            qvx23_i16, qvx01_i16);
+
+                    int8_t q8_replay_all[128]
+                        __attribute__((aligned(128)));
+                    hvx_vec_store_u(
+                        q8_replay_all, 128, qvx_i8);
+
+                    for (uint32_t kli = 0; kli < 32u; ++kli) {
+                        const int32_t qw =
+                            (int32_t)
+                                htp_raw_q4_0_get_nibble(
+                                    qs, kli) - 8;
+
+                        const int32_t qa_quant =
+                            (int32_t) q8_replay_all[
+                                q8_subblock * 32u + kli];
+
+                        const uint32_t ki =
+                            dbg_tile_idx * 32u + kli;
                         float xf = 0.0f;
                         memcpy(&xf,
-                            src1_orig_bytes + (size_t) ki * nb10,
+                            src1_orig_bytes +
+                                (size_t) ki * nb10,
                             sizeof(xf));
                         const __fp16 xh = (__fp16) xf;
+
                         int32_t qa_scalar = 0;
-                        if (q8s_f != 0.0f && isfinite(q8s_f)) {
-                            qa_scalar = (int32_t) roundf((float) xh / q8s_f);
-                            if (qa_scalar > 127)  qa_scalar = 127;
-                            if (qa_scalar < -128) qa_scalar = -128;
-                        }
-                        mmctx->dbg_v115_q8_scalar[kli] = (int8_t) qa_scalar;
-
-                        // Build 32 raw Q4 rows. Row 0 carries the one-hot vector;
-                        // rows 1..31 are all zero. Q4_0 zero is nibble 8.
-                        memset(probe_raw, 0, sizeof(probe_raw));
-                        for (uint32_t rr = 0; rr < 32; ++rr) {
-                            uint8_t * rb = probe_raw + rr * 18u;
-                            uint16_t one_scale = 0x3c00u; // fp16 1.0
-                            memcpy(rb, &one_scale, sizeof(one_scale));
-                            memset(rb + 2, 0x88, 16); // all logical q4 values = 0
+                        if (q8s_f != 0.0f &&
+                            isfinite(q8s_f)) {
+                            qa_scalar =
+                                (int32_t) roundf(
+                                    (float) xh / q8s_f);
+                            if (qa_scalar > 127)
+                                qa_scalar = 127;
+                            if (qa_scalar < -128)
+                                qa_scalar = -128;
                         }
 
-                        // Set row0 logical index kli to +1 => nibble 9.
-                        uint8_t * row0_qs = probe_raw + 2;
-                        const uint32_t bi = kli >> 1;
-                        if ((kli & 1u) == 0) {
-                            row0_qs[bi] = (uint8_t) ((row0_qs[bi] & 0xf0u) | 0x09u);
-                        } else {
-                            row0_qs[bi] = (uint8_t) ((row0_qs[bi] & 0x0fu) | 0x90u);
-                        }
-
-                        memset(probe_tiled, 0, sizeof(probe_tiled));
-                        htp_raw_q4_0_32rows_to_tiled(probe_raw, 18u, probe_tiled, 32u, 32u);
-
-                        const HVX_Vector * pv = (const HVX_Vector *) probe_tiled;
-                        HVX_Vector one_sum =
-                            accum_4bit_32x1(pv, dbg_vact, dbg_i8);
-                        int32_t one_words[32] __attribute__((aligned(128)));
-                        hvx_vec_store_u(one_words, 128, one_sum);
-
-                        int32_t qa_actual = one_words[0];
-                        if (qa_actual > 127)  qa_actual = 127;
-                        if (qa_actual < -128) qa_actual = -128;
-                        mmctx->dbg_v115_q8_actual[kli] = (int8_t) qa_actual;
-
-                        const int32_t qw = (int32_t) mmctx->dbg_v115_q4_weight[kli];
+                        mmctx->dbg_v115_q4_weight[kli] =
+                            (int8_t) qw;
+                        mmctx->dbg_v115_q8_actual[kli] =
+                            (int8_t) qa_quant;
+                        mmctx->dbg_v115_q8_scalar[kli] =
+                            (int8_t) qa_scalar;
                         mmctx->dbg_v115_prod_delta[kli] =
-                            (int16_t) (qw * (qa_actual - qa_scalar));
+                            (int16_t) (
+                                qw *
+                                (qa_quant - qa_scalar));
                     }
 
                     // Exact single-tile floating result from the official kernel.
