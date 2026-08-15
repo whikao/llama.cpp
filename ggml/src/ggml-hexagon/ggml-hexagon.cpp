@@ -1690,7 +1690,31 @@ struct ggml_hexagon_opqueue {
                 (size_t) dbuf.size, b_size, t_size, o_size);
 
         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
+        uint8_t * o_ptr = m_ptr + (b_size + t_size);
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
+
+        // v10.3: DSP writes its first raw-Q4_0 selected-expert fingerprint back into
+        // the already-shared kernel_params blob after the op has completed.
+        // This bypasses FARF/logcat entirely.
+        if (opt_mmid_raw_q4_0 && rsp.n_ops > 0) {
+            const htp_op_desc * returned_ops = (const htp_op_desc *) o_ptr;
+            static int dbg_v103_host_count = 0;
+            for (uint32_t i = 0; i < rsp.n_ops && dbg_v103_host_count < 32; ++i) {
+                const struct htp_mm_kernel_params * kp =
+                    (const struct htp_mm_kernel_params *) returned_ops[i].kernel_params;
+                if ((uint32_t) kp->kernel_type == HTP_MM_DEBUG_RETURN_MAGIC) {
+                    GGML_LOG_INFO(
+                        "DBG_V103_DSP_RETURN: dev=%s op=%u expert=%u src_off=%u raw_fnv=%08x tile_fnv=%08x\n",
+                        shm_buf->sess->c_name(),
+                        i,
+                        (uint32_t) kp->pipeline,
+                        (uint32_t) kp->n_threads,
+                        (uint32_t) kp->m_chunk,
+                        (uint32_t) kp->n_chunk);
+                    ++dbg_v103_host_count;
+                }
+            }
+        }
 
         if (opt_profile && rsp.n_ops > 0) {
             auto & ops = op_cache[rsp.id];
