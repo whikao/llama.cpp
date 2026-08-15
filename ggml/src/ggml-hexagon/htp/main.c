@@ -973,6 +973,58 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
     return status;
 }
 
+static uint32_t dbg_v119_fnv1a(const uint8_t * data, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; ++i) {
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void dbg_v119_capture_postop(
+        struct htp_postop_trace_record * rec,
+        uint32_t ordinal,
+        uint32_t op_index,
+        const struct htp_op_desc * op,
+        struct htp_tensor * tens) {
+    memset(rec, 0, sizeof(*rec));
+
+    if (!op || op->dst[0] == 0xffff) {
+        return;
+    }
+
+    struct htp_tensor * dst = &tens[op->dst[0]];
+    if (!dst || dst->data == 0 || dst->size == 0) {
+        return;
+    }
+
+    rec->valid = 1;
+    rec->ordinal = ordinal;
+    rec->op_index = op_index;
+    rec->opcode = op->opcode;
+    rec->dst_index = op->dst[0];
+    rec->type = dst->type;
+    rec->size = dst->size;
+    rec->ne0 = dst->ne[0];
+    rec->ne1 = dst->ne[1];
+    rec->ne2 = dst->ne[2];
+    rec->ne3 = dst->ne[3];
+
+    const uint8_t * ptr = (const uint8_t *) (uintptr_t) dst->data;
+    const uint32_t hash_bytes = MIN(dst->size, 4096u);
+    rec->hash_bytes = hash_bytes;
+    rec->fnv = dbg_v119_fnv1a(ptr, hash_bytes);
+
+    uint32_t copy_bytes = MIN(dst->size, 16u);
+    uint8_t first[16] = {0};
+    memcpy(first, ptr, copy_bytes);
+    memcpy(&rec->word0, first + 0, 4);
+    memcpy(&rec->word1, first + 4, 4);
+    memcpy(&rec->word2, first + 8, 4);
+    memcpy(&rec->word3, first + 12, 4);
+}
+
 static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_req * req, const struct dspqueue_buffer * dbuf) {
     dspqueue_t queue = ctx->dsp_queue;
     int err;
@@ -1080,12 +1132,30 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     int8_t  dbg_q4_weight[32] = {0};
     int16_t dbg_prod_delta[32] = {0};
 
+    // v10.19 post-op trace records for marked consecutive ops.
+    uint32_t dbg_trace_count = 0;
+    struct htp_postop_trace_record dbg_trace[HTP_POSTOP_TRACE_MAX_RECORDS];
+    memset(dbg_trace, 0, sizeof(dbg_trace));
+
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
 
         profile_start(ctx->profiler, &prof);
 
         op_status = proc_op_req(octx, tens, i, &ops[i]);
+
+        if (op_status == HTP_STATUS_OK &&
+            dbg_trace_count < HTP_POSTOP_TRACE_MAX_RECORDS &&
+            (uint32_t) ops[i].kernel_params[HTP_POSTOP_TRACE_WORD_MAGIC] ==
+                HTP_POSTOP_TRACE_MAGIC) {
+            dbg_v119_capture_postop(
+                &dbg_trace[dbg_trace_count],
+                (uint32_t) ops[i].kernel_params[HTP_POSTOP_TRACE_WORD_ORDINAL],
+                i,
+                &ops[i],
+                tens);
+            dbg_trace_count++;
+        }
 
         // op_matmul_id() v10.3 stores its first selected-expert fingerprint into
         // the *local* octx->kernel_params copy after computation. Capture it here,
@@ -1215,6 +1285,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_k32_int_dot  = dbg_k32_int_dot;
     rsp.dbg_k32_scales_fp16 = dbg_k32_scales_fp16;
     rsp.dbg_hvx_int_dot = dbg_hvx_int_dot;
+
+    rsp.dbg_trace_count = dbg_trace_count;
+    memcpy(rsp.dbg_trace, dbg_trace, sizeof(dbg_trace));
     rsp.dbg_full_ref_bits = dbg_full_ref_bits;
     memcpy(rsp.dbg_q8_actual, dbg_q8_actual, sizeof(dbg_q8_actual));
     memcpy(rsp.dbg_q8_scalar, dbg_q8_scalar, sizeof(dbg_q8_scalar));

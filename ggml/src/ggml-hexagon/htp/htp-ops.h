@@ -119,6 +119,13 @@ enum htp_op_code {
 #define HTP_MM_DEBUG_CTRL_WORD_K       36
 #define HTP_MM_DEBUG_CTRL_WORD_FLAGS   37
 
+// v10.19 generic post-op trace controls.
+// Host marks a target op and the following N ops; DSP snapshots dst0 after each.
+#define HTP_POSTOP_TRACE_MAGIC          0x54523139u /* "TR19" */
+#define HTP_POSTOP_TRACE_WORD_MAGIC     120
+#define HTP_POSTOP_TRACE_WORD_ORDINAL   121
+#define HTP_POSTOP_TRACE_MAX_RECORDS    8
+
 
 #define HTP_OP_MAX_BUFS    16
 #define HTP_OP_MAX_TENSORS 8192 // must stay under 64K (uint16)
@@ -233,6 +240,26 @@ struct htp_opbatch_req {
 
 #define HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC 0x51343034u  /* "Q404": v10.4 raw-Q4_0 debug response */
 
+struct htp_postop_trace_record {
+    uint32_t valid;
+    uint32_t ordinal;
+    uint32_t op_index;
+    uint32_t opcode;
+    uint32_t dst_index;
+    uint32_t type;
+    uint32_t size;
+    uint32_t hash_bytes;
+    uint32_t fnv;
+    uint32_t word0;
+    uint32_t word1;
+    uint32_t word2;
+    uint32_t word3;
+    uint32_t ne0;
+    uint32_t ne1;
+    uint32_t ne2;
+    uint32_t ne3;
+};
+
 struct htp_opbatch_rsp {
     uint32_t id;         // Batch id
     uint32_t status;     // HTP_STATUS_...
@@ -303,6 +330,10 @@ struct htp_opbatch_rsp {
     int8_t  dbg_q8_scalar[32];
     int8_t  dbg_q4_weight[32];
     int16_t dbg_prod_delta[32];
+
+    // v10.19: up to 8 consecutive post-op checkpoints.
+    uint32_t dbg_trace_count;
+    struct htp_postop_trace_record dbg_trace[HTP_POSTOP_TRACE_MAX_RECORDS];
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
