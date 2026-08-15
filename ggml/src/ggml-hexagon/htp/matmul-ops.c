@@ -65,6 +65,14 @@ struct htp_mm_context {
     const char * type;
     struct htp_ops_context * octx;
 
+    // v10.3 raw-Q4_0 correctness return. These live only for one op invocation,
+    // so worker threads can record the first selected expert without relying on FARF/logcat.
+    volatile uint32_t dbg_v103_claimed;
+    uint32_t dbg_v103_expert;
+    uint32_t dbg_v103_raw_fnv;
+    uint32_t dbg_v103_tile_fnv;
+    uint32_t dbg_v103_src_off;
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1246,10 +1254,10 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             // Convert only this working set; no model-sized REPACK allocation.
             htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
 
-            // v10.2: fingerprint the exact selected expert and the first converted
-            // tile that the DSP is about to feed to tiled_vec_dot_q4_0_32x1().
-            static int dbg_v102_dsp_count = 0;
-            if (dbg_v102_dsp_count < 16 && ct == ct_start) {
+            // v10.3: capture the first selected expert into this op's mmctx.
+            // The result is copied into the shared kernel_params blob only after all
+            // worker threads finish, so it cannot disturb execution parameters.
+            if (__sync_bool_compare_and_swap(&mmctx->dbg_v103_claimed, 0, 1)) {
                 const size_t raw_bytes = (size_t) valid_rows * raw_row_size;
 
                 uint32_t raw_fnv = 2166136261u;
@@ -1264,26 +1272,10 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     tile_fnv *= 16777619u;
                 }
 
-                FARF(ALWAYS,
-                     "DBG_V102_DSP: expert=%u cne1=%d src_off=%u ct=%u "
-                     "ne00=%u ne01=%u ne02=%u nb01=%u nb02=%u raw_bytes=%u "
-                     "raw_fnv=%08x tile_fnv=%08x first=%02x%02x%02x%02x scale=%02x%02x",
-                     (unsigned) cur_a,
-                     (int) cne1,
-                     (unsigned) (cur_a * nb02),
-                     (unsigned) ct,
-                     (unsigned) ne00,
-                     (unsigned) ne01,
-                     (unsigned) ne02,
-                     (unsigned) nb01,
-                     (unsigned) nb02,
-                     (unsigned) raw_bytes,
-                     (unsigned) raw_fnv,
-                     (unsigned) tile_fnv,
-                     tiled_buf[0], tiled_buf[1], tiled_buf[2], tiled_buf[3],
-                     tiled_buf[512], tiled_buf[513]);
-
-                ++dbg_v102_dsp_count;
+                mmctx->dbg_v103_expert   = cur_a;
+                mmctx->dbg_v103_raw_fnv  = raw_fnv;
+                mmctx->dbg_v103_tile_fnv = tile_fnv;
+                mmctx->dbg_v103_src_off  = cur_a * nb02;
             }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -3906,6 +3898,20 @@ int op_matmul_id(struct htp_ops_context * octx) {
         } else {
             s = HTP_STATUS_NO_SUPPORT;
         }
+    }
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0 &&
+        mmctx->dbg_v103_claimed) {
+        struct htp_mm_kernel_params * dbg_kparams =
+            (struct htp_mm_kernel_params *) octx->kernel_params;
+
+        // The op has finished, so these execution fields are dead. Reuse five int32 slots
+        // as a tiny DSP->host return channel without changing the fixed 128-byte ABI.
+        dbg_kparams->kernel_type = (int32_t) HTP_MM_DEBUG_RETURN_MAGIC;
+        dbg_kparams->pipeline    = (int32_t) mmctx->dbg_v103_expert;
+        dbg_kparams->m_chunk     = (int32_t) mmctx->dbg_v103_raw_fnv;
+        dbg_kparams->n_chunk     = (int32_t) mmctx->dbg_v103_tile_fnv;
+        dbg_kparams->n_threads   = (int32_t) mmctx->dbg_v103_src_off;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {

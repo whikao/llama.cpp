@@ -71,6 +71,8 @@ enum htp_mm_kernel_type {
 };
 
 // Op-specific struct for precomputed matmul params
+#define HTP_MM_DEBUG_RETURN_MAGIC 0x51343033u  /* "Q403" = raw-Q4_0 v10.3 debug return */
+
 struct htp_mm_kernel_params {
     int32_t  kernel_type;        // enum htp_mm_kernel_type
     int32_t  pipeline;           // 1 = pipelined execution, 0 = standard
