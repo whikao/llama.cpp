@@ -1079,8 +1079,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 if (dbg_v105_pair_count < 16) {
                     GGML_LOG_INFO(
                         "DBG_V105_STAGE_SYNCED: dev=%s tensor=%s offset=%zu size=%zu "
-                        "start_ok=%d end_ok=%d
-",
+                        "start_ok=%d end_ok=%d\n",
                         sess->c_name(), tensor->name, offset, size,
                         sync_start_ok ? 1 : 0, sync_end_ok ? 1 : 0);
                     ++dbg_v105_pair_count;
