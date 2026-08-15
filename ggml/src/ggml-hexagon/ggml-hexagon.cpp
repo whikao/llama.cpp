@@ -1837,6 +1837,47 @@ struct ggml_hexagon_opqueue {
         uint8_t * o_ptr = m_ptr + (b_size + t_size);
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
 
+        // v10.20 detailed MUL_MAT_ID per-slice input/output diagnostics.
+        if (rsp.dbg_mmid_slice_count > 0) {
+            const uint32_t ns = std::min<uint32_t>(
+                rsp.dbg_mmid_slice_count, HTP_MMID_SLICE_TRACE_MAX);
+
+            for (uint32_t si = 0; si < ns; ++si) {
+                const auto & r = rsp.dbg_mmid_slice[si];
+                if (!r.valid) continue;
+
+                union { uint32_t u; float f; } s0,s1,s2,s3,d0,d1,d2,d3,sm,dm;
+                s0.u=r.src1_word0; s1.u=r.src1_word1;
+                s2.u=r.src1_word2; s3.u=r.src1_word3;
+                d0.u=r.dst_word0; d1.u=r.dst_word1;
+                d2.u=r.dst_word2; d3.u=r.dst_word3;
+                sm.u=r.src1_maxabs_bits; dm.u=r.dst_maxabs_bits;
+
+                GGML_LOG_INFO(
+                    "DBG_V120_MMID_SLICE: dev=%s batch=%u slice=%u "
+                    "src_ne=%u,%u,%u,%u src_nb=%u,%u,%u,%u "
+                    "src_fnv=%08x src_nonfinite=%u src_maxabs=%g "
+                    "src_f32=%g,%g,%g,%g "
+                    "ids_ne=%u,%u ids_nb=%u,%u "
+                    "ids=%d,%d,%d,%d,%d,%d,%d,%d "
+                    "dst_ne=%u,%u,%u,%u dst_nb=%u,%u,%u,%u "
+                    "dst_fnv=%08x dst_nonfinite=%u dst_maxabs=%g "
+                    "dst_f32=%g,%g,%g,%g\n",
+                    shm_buf->sess->c_name(), rsp.id, r.slice,
+                    r.src1_ne0,r.src1_ne1,r.src1_ne2,r.src1_ne3,
+                    r.src1_nb0,r.src1_nb1,r.src1_nb2,r.src1_nb3,
+                    r.src1_hash,r.src1_nonfinite,sm.f,
+                    s0.f,s1.f,s2.f,s3.f,
+                    r.ids_ne0,r.ids_ne1,r.ids_nb0,r.ids_nb1,
+                    r.ids0,r.ids1,r.ids2,r.ids3,
+                    r.ids4,r.ids5,r.ids6,r.ids7,
+                    r.dst_ne0,r.dst_ne1,r.dst_ne2,r.dst_ne3,
+                    r.dst_nb0,r.dst_nb1,r.dst_nb2,r.dst_nb3,
+                    r.dst_hash,r.dst_nonfinite,dm.f,
+                    d0.f,d1.f,d2.f,d3.f);
+            }
+        }
+
         // v10.19 generic post-op trace.
         if (rsp.dbg_trace_count > 0) {
             const auto & cached_ops = op_cache[rsp.id];
