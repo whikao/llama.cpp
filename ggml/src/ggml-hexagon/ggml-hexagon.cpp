@@ -1889,8 +1889,8 @@ struct ggml_hexagon_opqueue {
                     if (rsp.dbg_q8_actual[ei] != rsp.dbg_q8_scalar[ei] ||
                         rsp.dbg_prod_delta[ei] != 0) {
                         GGML_LOG_INFO(
-                            "DBG_V115_Q8_ELEM: tile=%u k=%u q4=%d "
-                            "q8_actual=%d q8_scalar=%d prod_delta=%d\n",
+                            "DBG_V116_Q8_ELEM: tile=%u k=%u q4=%d "
+                            "q8_quant=%d q8_scalar=%d prod_delta=%d\n",
                             rsp.dbg_runtime_k / 32u - 1u,
                             rsp.dbg_runtime_k - 32u + ei,
                             (int) rsp.dbg_q4_weight[ei],
@@ -1900,7 +1900,7 @@ struct ggml_hexagon_opqueue {
                     }
                 }
                 GGML_LOG_INFO(
-                    "DBG_V115_Q8_SUM: tile=%u delta_sum=%d "
+                    "DBG_V116_Q8_SUM: tile=%u delta_sum=%d "
                     "hvx_minus_scalar_int=%d\n",
                     rsp.dbg_runtime_k / 32u - 1u,
                     delta_sum,
