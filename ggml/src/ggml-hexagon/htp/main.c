@@ -1046,9 +1046,18 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     uint32_t dbg_src_off  = 0;
     uint32_t dbg_raw_fnv    = 0;
     uint32_t dbg_tile_fnv   = 0;
-    uint32_t dbg_ct         = 0;
-    uint32_t dbg_ith        = 0;
-    uint32_t dbg_valid_rows = 0;
+    uint32_t dbg_ct          = 0;
+    uint32_t dbg_ith         = 0;
+    uint32_t dbg_valid_rows  = 0;
+    uint32_t dbg_ne00        = 0;
+    uint32_t dbg_ne10        = 0;
+    uint32_t dbg_nb01        = 0;
+    uint32_t dbg_nb02        = 0;
+    uint32_t dbg_src1_stride = 0;
+    uint32_t dbg_rm1         = 0;
+    uint32_t dbg_rm2         = 0;
+    uint32_t dbg_ir1         = 0;
+    uint32_t dbg_src1_off    = 0;
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1072,6 +1081,16 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             dbg_ct          = (uint32_t) octx->kernel_params[5];
             dbg_ith         = (uint32_t) octx->kernel_params[6];
             dbg_valid_rows  = (uint32_t) octx->kernel_params[7];
+
+            dbg_ne00        = (uint32_t) octx->kernel_params[8];
+            dbg_ne10        = (uint32_t) octx->kernel_params[9];
+            dbg_nb01        = (uint32_t) octx->kernel_params[10];
+            dbg_nb02        = (uint32_t) octx->kernel_params[11];
+            dbg_src1_stride = (uint32_t) octx->kernel_params[12];
+            dbg_rm1         = (uint32_t) octx->kernel_params[13];
+            dbg_rm2         = (uint32_t) octx->kernel_params[14];
+            dbg_ir1         = (uint32_t) octx->kernel_params[15];
+            dbg_src1_off    = (uint32_t) octx->kernel_params[16];
         }
 
         profile_stop(ctx->profiler, &prof);
@@ -1117,9 +1136,18 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_src_off  = dbg_src_off;
     rsp.dbg_raw_fnv    = dbg_raw_fnv;
     rsp.dbg_tile_fnv   = dbg_tile_fnv;
-    rsp.dbg_ct         = dbg_ct;
-    rsp.dbg_ith        = dbg_ith;
-    rsp.dbg_valid_rows = dbg_valid_rows;
+    rsp.dbg_ct          = dbg_ct;
+    rsp.dbg_ith         = dbg_ith;
+    rsp.dbg_valid_rows  = dbg_valid_rows;
+    rsp.dbg_ne00        = dbg_ne00;
+    rsp.dbg_ne10        = dbg_ne10;
+    rsp.dbg_nb01        = dbg_nb01;
+    rsp.dbg_nb02        = dbg_nb02;
+    rsp.dbg_src1_stride = dbg_src1_stride;
+    rsp.dbg_rm1         = dbg_rm1;
+    rsp.dbg_rm2         = dbg_rm2;
+    rsp.dbg_ir1         = dbg_ir1;
+    rsp.dbg_src1_off    = dbg_src1_off;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {

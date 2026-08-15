@@ -247,6 +247,17 @@ struct htp_opbatch_rsp {
     uint32_t dbg_ith;        // DSP worker thread that processed dbg_ct
     uint32_t dbg_valid_rows; // valid rows in dbg_ct
 
+    // v10.7: exact dot-call parameters for the captured expert/ct/cid=0.
+    uint32_t dbg_ne00;
+    uint32_t dbg_ne10;
+    uint32_t dbg_nb01;
+    uint32_t dbg_nb02;
+    uint32_t dbg_src1_stride;
+    uint32_t dbg_rm1;
+    uint32_t dbg_rm2;
+    uint32_t dbg_ir1;
+    uint32_t dbg_src1_off;
+
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 

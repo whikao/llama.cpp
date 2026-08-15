@@ -76,6 +76,17 @@ struct htp_mm_context {
     uint32_t dbg_v106_ith;
     uint32_t dbg_v106_valid_rows;
 
+    // v10.7: exact parameters passed to the first q4_0 dot for the captured tile.
+    uint32_t dbg_v107_ne00;
+    uint32_t dbg_v107_ne10;
+    uint32_t dbg_v107_nb01;
+    uint32_t dbg_v107_nb02;
+    uint32_t dbg_v107_src1_stride;
+    uint32_t dbg_v107_rm1;
+    uint32_t dbg_v107_rm2;
+    uint32_t dbg_v107_ir1;
+    uint32_t dbg_v107_src1_off;
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1285,6 +1296,24 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 mmctx->dbg_v106_ct         = ct;
                 mmctx->dbg_v106_ith        = ith;
                 mmctx->dbg_v106_valid_rows = valid_rows;
+
+                // Capture the exact first row mapping and activation address that will
+                // be paired with this weight tile. No computation is changed.
+                const struct mmid_row_mapping dbg_map = MMID_MATRIX_ROW(cur_a, 0);
+                const uint32_t dbg_rm1 = dbg_map.i1;
+                const uint32_t dbg_rm2 = dbg_map.i2;
+                const uint32_t dbg_ir1 = fastmodulo(dbg_rm1, ne11, &mmctx->mm_div_ne11);
+
+                mmctx->dbg_v107_ne00        = ne00;
+                mmctx->dbg_v107_ne10        = ne10;
+                mmctx->dbg_v107_nb01        = nb01;
+                mmctx->dbg_v107_nb02        = nb02;
+                mmctx->dbg_v107_src1_stride = (uint32_t) src1_stride;
+                mmctx->dbg_v107_rm1         = dbg_rm1;
+                mmctx->dbg_v107_rm2         = dbg_rm2;
+                mmctx->dbg_v107_ir1         = dbg_ir1;
+                mmctx->dbg_v107_src1_off    =
+                    (uint32_t) ((dbg_ir1 + dbg_rm2 * ne11) * src1_stride);
             }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -3921,9 +3950,19 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_kparams->m_chunk       = (int32_t) mmctx->dbg_v103_raw_fnv;
         dbg_kparams->n_chunk       = (int32_t) mmctx->dbg_v103_tile_fnv;
         dbg_kparams->n_threads     = (int32_t) mmctx->dbg_v103_src_off;
-        dbg_kparams->n_act_threads = (int32_t) mmctx->dbg_v106_ct;
-        dbg_kparams->n_hmx         = (int32_t) mmctx->dbg_v106_ith;
-        dbg_kparams->n_prefetch    = (int32_t) mmctx->dbg_v106_valid_rows;
+        dbg_kparams->n_act_threads    = (int32_t) mmctx->dbg_v106_ct;
+        dbg_kparams->n_hmx            = (int32_t) mmctx->dbg_v106_ith;
+        dbg_kparams->n_prefetch       = (int32_t) mmctx->dbg_v106_valid_rows;
+
+        dbg_kparams->tile_size        = (int32_t) mmctx->dbg_v107_ne00;
+        dbg_kparams->aligned_tile_size= (int32_t) mmctx->dbg_v107_ne10;
+        dbg_kparams->src1_row_size    = (int32_t) mmctx->dbg_v107_nb01;
+        dbg_kparams->vtcm_size        = (int32_t) mmctx->dbg_v107_nb02;
+        dbg_kparams->vtcm_src0_size   = (int32_t) mmctx->dbg_v107_src1_stride;
+        dbg_kparams->vtcm_src1_size   = (int32_t) mmctx->dbg_v107_rm1;
+        dbg_kparams->vtcm_src2_size   = (int32_t) mmctx->dbg_v107_rm2;
+        dbg_kparams->vtcm_src3_size   = (int32_t) mmctx->dbg_v107_ir1;
+        dbg_kparams->vtcm_dst_size    = (int32_t) mmctx->dbg_v107_src1_off;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
