@@ -147,6 +147,50 @@ static void ggml_hexagon_apply_mmid_debug_ctrl(htp_opnode & node) {
         name ? name : "<null>", cfg.expert, cfg.ct, cfg.cid, cfg.k);
 }
 
+struct ggml_hexagon_postop_trace_cfg {
+    bool enabled = false;
+    std::string start_substr;
+    int32_t count = 8;
+};
+
+static const ggml_hexagon_postop_trace_cfg & ggml_hexagon_postop_trace_cfg_get() {
+    static const ggml_hexagon_postop_trace_cfg cfg = []() {
+        ggml_hexagon_postop_trace_cfg c;
+        const char * start = std::getenv("GGML_HEXAGON_TRACE_START");
+        c.enabled = start && *start;
+        if (start) c.start_substr = start;
+
+        const char * cnt = std::getenv("GGML_HEXAGON_TRACE_COUNT");
+        if (cnt && *cnt) {
+            char * end = nullptr;
+            long v = std::strtol(cnt, &end, 0);
+            if (end && *end == '\0') c.count = (int32_t) v;
+        }
+        if (c.count < 1) c.count = 1;
+        if (c.count > HTP_POSTOP_TRACE_MAX_RECORDS) {
+            c.count = HTP_POSTOP_TRACE_MAX_RECORDS;
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+static bool ggml_hexagon_postop_trace_match(const htp_opnode & node) {
+    const auto & cfg = ggml_hexagon_postop_trace_cfg_get();
+    if (!cfg.enabled) return false;
+
+    auto has = [&](const ggml_tensor * t) {
+        return t && t->name &&
+            std::strstr(t->name, cfg.start_substr.c_str()) != nullptr;
+    };
+
+    if (has(node.node)) return true;
+    for (const auto * t : node.get_inputs())  if (has(t)) return true;
+    for (const auto * t : node.get_outputs()) if (has(t)) return true;
+    return false;
+}
+
+
 static int    opt_mm_select = 3; // 3 = HMX -> Tiled -> Flat -> CPU, 2 = Tiled -> Flat -> CPU, 1 = Flat -> CPU
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 
@@ -1405,6 +1449,10 @@ struct ggml_hexagon_opbatch {
     unsigned int n_ops_max;
     size_t       b_vmem_max;
 
+    // v10.19: survives batch reset so a trace can cross an op-batch boundary.
+    int32_t trace_remaining = 0;
+    uint32_t trace_ordinal = 0;
+
     void reset() {
         n_bufs = 0;
         n_tens = 0;
@@ -1597,6 +1645,29 @@ struct ggml_hexagon_opbatch {
         htp_op_desc &o = h_ops[n];
         memcpy(o.params,        node.node->op_params, sizeof(node.node->op_params));
         memcpy(o.kernel_params, node.kernel_params,   sizeof(o.kernel_params));
+
+        // v10.19: arm on a tensor-name substring, then mark this and the next
+        // N-1 HTP ops. This works across batch boundaries.
+        const auto & trace_cfg = ggml_hexagon_postop_trace_cfg_get();
+        if (ggml_hexagon_postop_trace_match(node)) {
+            trace_remaining = trace_cfg.count;
+            trace_ordinal = 0;
+            GGML_LOG_INFO(
+                "DBG_V119_TRACE_ARM: dev=%s start=%s count=%d op=%s tensor=%s\n",
+                sess->c_name(),
+                trace_cfg.start_substr.c_str(),
+                trace_cfg.count,
+                node.op_name().c_str(),
+                node.node && node.node->name ? node.node->name : "<null>");
+        }
+        if (trace_remaining > 0) {
+            o.kernel_params[HTP_POSTOP_TRACE_WORD_MAGIC] =
+                (int32_t) HTP_POSTOP_TRACE_MAGIC;
+            o.kernel_params[HTP_POSTOP_TRACE_WORD_ORDINAL] =
+                (int32_t) trace_ordinal++;
+            trace_remaining--;
+        }
+
         o.opcode = node.opcode;
         o.flags  = 0;
 
@@ -1765,6 +1836,56 @@ struct ggml_hexagon_opqueue {
         uint8_t * m_ptr = (uint8_t*) dbuf.ptr;
         uint8_t * o_ptr = m_ptr + (b_size + t_size);
         uint8_t * p_ptr = m_ptr + (b_size + t_size + o_size);
+
+        // v10.19 generic post-op trace.
+        if (rsp.dbg_trace_count > 0) {
+            const auto & cached_ops = op_cache[rsp.id];
+            const uint32_t nrec = std::min<uint32_t>(
+                rsp.dbg_trace_count, HTP_POSTOP_TRACE_MAX_RECORDS);
+
+            for (uint32_t ri = 0; ri < nrec; ++ri) {
+                const auto & tr = rsp.dbg_trace[ri];
+                if (!tr.valid) continue;
+
+                const char * opname = "<unknown>";
+                const char * dstname = "<unknown>";
+                if (tr.op_index < cached_ops.size()) {
+                    const auto & cn = cached_ops[tr.op_index];
+                    static thread_local std::string op_tmp;
+                    op_tmp = cn.op_name();
+                    opname = op_tmp.c_str();
+                    auto outs = cn.get_outputs();
+                    if (!outs.empty() && outs[0] && outs[0]->name) {
+                        dstname = outs[0]->name;
+                    }
+                }
+
+                union { uint32_t u; float f; } w0, w1, w2, w3;
+                w0.u = tr.word0; w1.u = tr.word1;
+                w2.u = tr.word2; w3.u = tr.word3;
+
+                GGML_LOG_INFO(
+                    "DBG_V119_POSTOP: dev=%s batch=%u ord=%u opidx=%u opcode=%u "
+                    "op=%s dst=%s type=%u size=%u ne=%u,%u,%u,%u "
+                    "hash_bytes=%u fnv=%08x "
+                    "bits=%08x,%08x,%08x,%08x "
+                    "f32=%g,%g,%g,%g\\n",
+                    shm_buf->sess->c_name(),
+                    rsp.id,
+                    tr.ordinal,
+                    tr.op_index,
+                    tr.opcode,
+                    opname,
+                    dstname,
+                    tr.type,
+                    tr.size,
+                    tr.ne0, tr.ne1, tr.ne2, tr.ne3,
+                    tr.hash_bytes,
+                    tr.fnv,
+                    tr.word0, tr.word1, tr.word2, tr.word3,
+                    w0.f, w1.f, w2.f, w3.f);
+            }
+        }
 
         // v10.4: consume the explicit dspqueue response fields. Unlike v10.3,
         // these bytes are part of htp_opbatch_rsp itself, so they travel through
