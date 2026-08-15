@@ -94,6 +94,15 @@ struct htp_mm_context {
     uint32_t dbg_v108_out2;
     uint32_t dbg_v108_out3;
 
+    // v10.9: exact src1/Q8 activation diagnostics for the same captured MMID row.
+    uint32_t dbg_v109_quant_fnv;     // first 1152-byte Q8 tile after quant barrier
+    uint32_t dbg_v109_dot_fnv;       // same 1152 bytes immediately before dot
+    uint32_t dbg_v109_q8_head;       // first 4 bytes of tiled Q8 data
+    uint32_t dbg_v109_scale_head;    // first 4 bytes at Q8 tile + 1024 (scale vector)
+    uint32_t dbg_v109_src_f0_bits;   // source F32 first element
+    uint32_t dbg_v109_src_max_bits;  // max(abs(src[0..127])) as F32 bits
+    uint32_t dbg_v109_row_fnv;       // whole quantized src1 row (vtcm_src1_stride bytes)
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1238,6 +1247,58 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
         return;
     }
 
+    // v10.9: hvx_mm_run_quant_task() does not return until quant_barrier == 0,
+    // so vtcm_src1 is fully produced here. Capture only ith==0 to avoid races.
+    if (ith == 0 && mmctx->vtcm_src1 && mmctx->vtcm_src1_stride >= 1152) {
+        const uint8_t * q = mmctx->vtcm_src1;
+
+        uint32_t fnv_tile = 2166136261u;
+        for (size_t di = 0; di < 1152; ++di) {
+            fnv_tile ^= q[di];
+            fnv_tile *= 16777619u;
+        }
+        mmctx->dbg_v109_quant_fnv = fnv_tile;
+
+        uint32_t fnv_row = 2166136261u;
+        for (size_t di = 0; di < mmctx->vtcm_src1_stride; ++di) {
+            fnv_row ^= q[di];
+            fnv_row *= 16777619u;
+        }
+        mmctx->dbg_v109_row_fnv = fnv_row;
+
+        mmctx->dbg_v109_q8_head =
+            ((uint32_t) q[0]) |
+            ((uint32_t) q[1] << 8) |
+            ((uint32_t) q[2] << 16) |
+            ((uint32_t) q[3] << 24);
+
+        const uint8_t * scale = q + 1024;
+        mmctx->dbg_v109_scale_head =
+            ((uint32_t) scale[0]) |
+            ((uint32_t) scale[1] << 8) |
+            ((uint32_t) scale[2] << 16) |
+            ((uint32_t) scale[3] << 24);
+
+        // The captured v10.7 mapping for the first selected expert resolves to
+        // the same src1 row used below. At this point that mapping is not yet
+        // claimed, so record row-0 source diagnostics; v10.7 will report ir1/rm2
+        // and lets us verify that this is the row actually consumed.
+        const float * src_f = (const float *) octx->src[1]->data;
+        union { float f; uint32_t u; } f0, fmax;
+        f0.f = src_f[0];
+        float maxabs = 0.0f;
+        const uint32_t ncheck = ne10 < 128 ? ne10 : 128;
+        for (uint32_t di = 0; di < ncheck; ++di) {
+            const float av = fabsf(src_f[di]);
+            if (av > maxabs) {
+                maxabs = av;
+            }
+        }
+        fmax.f = maxabs;
+        mmctx->dbg_v109_src_f0_bits  = f0.u;
+        mmctx->dbg_v109_src_max_bits = fmax.u;
+    }
+
     struct htp_thread_trace * tr = &octx->ctx->trace[ith];
     const uint32_t n_as = ne02;
     const uint32_t * matrix_row_counts = mmctx->matrix_row_counts;
@@ -1333,6 +1394,17 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     src1_data + (ir1 + rm2 * ne11) * src1_stride;
                 float * restrict dst_row =
                     (float *) (dst->data + (rm1 * nb1 + rm2 * nb2));
+
+                if (ct == 0 && cid == 0 &&
+                    cur_a == mmctx->dbg_v103_expert &&
+                    mmctx->dbg_v103_claimed) {
+                    uint32_t fnv_dot = 2166136261u;
+                    for (size_t di = 0; di < 1152; ++di) {
+                        fnv_dot ^= src1_col[di];
+                        fnv_dot *= 16777619u;
+                    }
+                    mmctx->dbg_v109_dot_fnv = fnv_dot;
+                }
 
                 tiled_vec_dot_q4_0_32x1(
                     ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
@@ -3997,6 +4069,14 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_words[18] = (int32_t) mmctx->dbg_v108_out1;
         dbg_words[19] = (int32_t) mmctx->dbg_v108_out2;
         dbg_words[20] = (int32_t) mmctx->dbg_v108_out3;
+
+        dbg_words[21] = (int32_t) mmctx->dbg_v109_quant_fnv;
+        dbg_words[22] = (int32_t) mmctx->dbg_v109_dot_fnv;
+        dbg_words[23] = (int32_t) mmctx->dbg_v109_q8_head;
+        dbg_words[24] = (int32_t) mmctx->dbg_v109_scale_head;
+        dbg_words[25] = (int32_t) mmctx->dbg_v109_src_f0_bits;
+        dbg_words[26] = (int32_t) mmctx->dbg_v109_src_max_bits;
+        dbg_words[27] = (int32_t) mmctx->dbg_v109_row_fnv;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {

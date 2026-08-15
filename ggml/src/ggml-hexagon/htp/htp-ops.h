@@ -264,6 +264,15 @@ struct htp_opbatch_rsp {
     uint32_t dbg_out2;
     uint32_t dbg_out3;
 
+    // v10.9: src1/Q8 activation diagnostics.
+    uint32_t dbg_q8_quant_fnv;
+    uint32_t dbg_q8_dot_fnv;
+    uint32_t dbg_q8_head;
+    uint32_t dbg_q8_scale_head;
+    uint32_t dbg_src_f0_bits;
+    uint32_t dbg_src_max_bits;
+    uint32_t dbg_q8_row_fnv;
+
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
 
