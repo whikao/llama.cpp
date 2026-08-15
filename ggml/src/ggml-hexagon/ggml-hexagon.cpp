@@ -1906,6 +1906,50 @@ struct ggml_hexagon_opqueue {
                     delta_sum,
                     rsp.dbg_hvx_int_dot - rsp.dbg_k32_int_dot);
 
+                int32_t vrmpy_actual_sum = 0;
+                int32_t vrmpy_manual_sum = 0;
+                for (uint32_t gi = 0;
+                     gi < 8u; ++gi) {
+                    int8_t wb[4];
+                    int8_t ab[4];
+                    memcpy(
+                        wb,
+                        &rsp.dbg_vrmpy_w4[gi], 4);
+                    memcpy(
+                        ab,
+                        &rsp.dbg_vrmpy_a4[gi], 4);
+
+                    vrmpy_actual_sum +=
+                        rsp.dbg_vrmpy_actual[gi];
+                    vrmpy_manual_sum +=
+                        rsp.dbg_vrmpy_manual[gi];
+
+                    GGML_LOG_INFO(
+                        "DBG_V117_VRMPY: g=%u "
+                        "actual=%d manual=%d "
+                        "w=%d,%d,%d,%d "
+                        "a=%d,%d,%d,%d\n",
+                        gi,
+                        rsp.dbg_vrmpy_actual[gi],
+                        rsp.dbg_vrmpy_manual[gi],
+                        (int) wb[0],
+                        (int) wb[1],
+                        (int) wb[2],
+                        (int) wb[3],
+                        (int) ab[0],
+                        (int) ab[1],
+                        (int) ab[2],
+                        (int) ab[3]);
+                }
+                GGML_LOG_INFO(
+                    "DBG_V117_VRMPY_SUM: "
+                    "actual_sum=%d manual_sum=%d "
+                    "hvx_int_dot=%d\n",
+                    vrmpy_actual_sum,
+                    vrmpy_manual_sum,
+                    rsp.dbg_hvx_int_dot);
+
+
 
                 ++dbg_v104_host_count;
             }
