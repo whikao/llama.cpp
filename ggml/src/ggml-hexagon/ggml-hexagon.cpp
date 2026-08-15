@@ -1860,15 +1860,19 @@ struct ggml_hexagon_opqueue {
                 const uint32_t q8_scale_fp16 =
                     rsp.dbg_k32_scales_fp16 >> 16;
                 GGML_LOG_INFO(
-                    "DBG_V112_K_REF: dev=%s batch=%u op=%u expert=%u ct=%u k=%u "
-                    "hvx=%g ref=%g hvx_bits=%08x ref_bits=%08x "
-                    "first_int_dot=%d q4_scale0_fp16=%04x q8_scale0_fp16=%04x\n",
+                    "DBG_V113_TILE_REF: dev=%s batch=%u op=%u expert=%u ct=%u "
+                    "k_boundary=%u tile=%u k0=%u k1=%u "
+                    "hvx_tile=%g ref_tile=%g hvx_bits=%08x ref_bits=%08x "
+                    "int_dot=%d q4_scale_fp16=%04x q8_scale_fp16=%04x\n",
                     shm_buf->sess->c_name(),
                     rsp.id,
                     rsp.dbg_op_index,
                     rsp.dbg_expert,
                     rsp.dbg_ct,
                     rsp.dbg_runtime_k,
+                    rsp.dbg_runtime_k / 32u - 1u,
+                    rsp.dbg_runtime_k - 32u,
+                    rsp.dbg_runtime_k - 1u,
                     hk.f,
                     rk.f,
                     rsp.dbg_hvx_k32_bits,
