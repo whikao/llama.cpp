@@ -1714,6 +1714,28 @@ struct ggml_hexagon_opqueue {
                     rsp.dbg_src_off,
                     rsp.dbg_raw_fnv,
                     rsp.dbg_tile_fnv);
+
+                GGML_LOG_INFO(
+                    "DBG_V107_DOT_PARAMS: dev=%s batch=%u op=%u expert=%u ct=%u "
+                    "ne00=%u ne10=%u nb01=%u nb02=%u src1_stride=%u "
+                    "rm1=%u rm2=%u ir1=%u src1_off=%u dot_k=%u valid_rows=%u\n",
+                    shm_buf->sess->c_name(),
+                    rsp.id,
+                    rsp.dbg_op_index,
+                    rsp.dbg_expert,
+                    rsp.dbg_ct,
+                    rsp.dbg_ne00,
+                    rsp.dbg_ne10,
+                    rsp.dbg_nb01,
+                    rsp.dbg_nb02,
+                    rsp.dbg_src1_stride,
+                    rsp.dbg_rm1,
+                    rsp.dbg_rm2,
+                    rsp.dbg_ir1,
+                    rsp.dbg_src1_off,
+                    rsp.dbg_ne10,
+                    rsp.dbg_valid_rows);
+
                 ++dbg_v104_host_count;
             }
         }
