@@ -1780,6 +1780,30 @@ struct ggml_hexagon_opqueue {
                     sf0.f,
                     smax.f);
 
+                union { uint32_t u; float f; } hk, rk;
+                hk.u = rsp.dbg_hvx_k32_bits;
+                rk.u = rsp.dbg_ref_k32_bits;
+                const uint32_t q4_scale_fp16 =
+                    rsp.dbg_k32_scales_fp16 & 0xffffu;
+                const uint32_t q8_scale_fp16 =
+                    rsp.dbg_k32_scales_fp16 >> 16;
+                GGML_LOG_INFO(
+                    "DBG_V111_K32_REF: dev=%s batch=%u op=%u expert=%u ct=%u "
+                    "hvx_k32=%g ref_k32=%g hvx_bits=%08x ref_bits=%08x "
+                    "int_dot=%d q4_scale_fp16=%04x q8_scale_fp16=%04x\n",
+                    shm_buf->sess->c_name(),
+                    rsp.id,
+                    rsp.dbg_op_index,
+                    rsp.dbg_expert,
+                    rsp.dbg_ct,
+                    hk.f,
+                    rk.f,
+                    rsp.dbg_hvx_k32_bits,
+                    rsp.dbg_ref_k32_bits,
+                    rsp.dbg_k32_int_dot,
+                    q4_scale_fp16,
+                    q8_scale_fp16);
+
                 ++dbg_v104_host_count;
             }
         }
