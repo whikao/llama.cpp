@@ -1058,6 +1058,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     uint32_t dbg_rm2         = 0;
     uint32_t dbg_ir1         = 0;
     uint32_t dbg_src1_off    = 0;
+    uint32_t dbg_out0        = 0;
+    uint32_t dbg_out1        = 0;
+    uint32_t dbg_out2        = 0;
+    uint32_t dbg_out3        = 0;
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1091,6 +1095,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             dbg_rm2         = (uint32_t) octx->kernel_params[14];
             dbg_ir1         = (uint32_t) octx->kernel_params[15];
             dbg_src1_off    = (uint32_t) octx->kernel_params[16];
+            dbg_out0        = (uint32_t) octx->kernel_params[17];
+            dbg_out1        = (uint32_t) octx->kernel_params[18];
+            dbg_out2        = (uint32_t) octx->kernel_params[19];
+            dbg_out3        = (uint32_t) octx->kernel_params[20];
         }
 
         profile_stop(ctx->profiler, &prof);
@@ -1148,6 +1156,10 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_rm2         = dbg_rm2;
     rsp.dbg_ir1         = dbg_ir1;
     rsp.dbg_src1_off    = dbg_src1_off;
+    rsp.dbg_out0        = dbg_out0;
+    rsp.dbg_out1        = dbg_out1;
+    rsp.dbg_out2        = dbg_out2;
+    rsp.dbg_out3        = dbg_out3;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {

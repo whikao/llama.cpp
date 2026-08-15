@@ -87,6 +87,12 @@ struct htp_mm_context {
     uint32_t dbg_v107_ir1;
     uint32_t dbg_v107_src1_off;
 
+    // v10.8: first four post-dot output float bit patterns for the captured ct=0 row.
+    uint32_t dbg_v108_out0;
+    uint32_t dbg_v108_out1;
+    uint32_t dbg_v108_out2;
+    uint32_t dbg_v108_out3;
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1329,6 +1335,19 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
                 tiled_vec_dot_q4_0_32x1(
                     ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+                // v10.8: capture output immediately after the first dot call for ct=0.
+                // No computation is modified; only float bit patterns are recorded.
+                if (ct == 0 && kt == 0 && mmctx->dbg_v103_claimed) {
+                    union { float f; uint32_t u; } d0, d1, d2, d3;
+                    d0.f = dst_col[0];
+                    d1.f = dst_col[1];
+                    d2.f = dst_col[2];
+                    d3.f = dst_col[3];
+                    mmctx->dbg_v108_out0 = d0.u;
+                    mmctx->dbg_v108_out1 = d1.u;
+                    mmctx->dbg_v108_out2 = d2.u;
+                    mmctx->dbg_v108_out3 = d3.u;
+                }
             }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
         }
@@ -3963,6 +3982,11 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_kparams->vtcm_src2_size   = (int32_t) mmctx->dbg_v107_rm2;
         dbg_kparams->vtcm_src3_size   = (int32_t) mmctx->dbg_v107_ir1;
         dbg_kparams->vtcm_dst_size    = (int32_t) mmctx->dbg_v107_src1_off;
+
+        dbg_kparams->raw_bytes        = (int32_t) mmctx->dbg_v108_out0;
+        dbg_kparams->raw_row_size     = (int32_t) mmctx->dbg_v108_out1;
+        dbg_kparams->raw_nrows        = (int32_t) mmctx->dbg_v108_out2;
+        dbg_kparams->raw_reserved     = (int32_t) mmctx->dbg_v108_out3;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
