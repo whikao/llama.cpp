@@ -107,7 +107,18 @@ enum htp_op_code {
 #define HTP_OP_MAX_INPUTS  6    // aka GGML_MAX_SRCS
 #define HTP_OP_MAX_OUTPUTS 4
 #define HTP_OP_MAX_PARAMS  16   // aka GGML_MAX_OP_PARAMS
-#define HTP_OP_MAX_KERN_PARAMS 32
+// v10.12: preserve the original first 32 words and reserve 8 extra
+// Host -> DSP runtime MMID debug-control words.
+#define HTP_OP_MAX_KERN_PARAMS 40
+
+#define HTP_MM_DEBUG_CTRL_MAGIC 0x44423132u /* "DB12" */
+#define HTP_MM_DEBUG_CTRL_WORD_MAGIC   32
+#define HTP_MM_DEBUG_CTRL_WORD_EXPERT  33
+#define HTP_MM_DEBUG_CTRL_WORD_CT      34
+#define HTP_MM_DEBUG_CTRL_WORD_CID     35
+#define HTP_MM_DEBUG_CTRL_WORD_K       36
+#define HTP_MM_DEBUG_CTRL_WORD_FLAGS   37
+
 
 #define HTP_OP_MAX_BUFS    16
 #define HTP_OP_MAX_TENSORS 8192 // must stay under 64K (uint16)
@@ -278,6 +289,9 @@ struct htp_opbatch_rsp {
     uint32_t dbg_ref_k32_bits;
     int32_t  dbg_k32_int_dot;
     uint32_t dbg_k32_scales_fp16;
+
+    // v10.12 runtime-selected cumulative-K checkpoint.
+    uint32_t dbg_runtime_k;
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };

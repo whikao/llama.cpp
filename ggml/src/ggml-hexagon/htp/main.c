@@ -1193,6 +1193,11 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_ref_k32_bits = dbg_ref_k32_bits;
     rsp.dbg_k32_int_dot  = dbg_k32_int_dot;
     rsp.dbg_k32_scales_fp16 = dbg_k32_scales_fp16;
+    rsp.dbg_runtime_k =
+        ((uint32_t) octx->kernel_params[HTP_MM_DEBUG_CTRL_WORD_MAGIC] ==
+         HTP_MM_DEBUG_CTRL_MAGIC)
+            ? (uint32_t) octx->kernel_params[HTP_MM_DEBUG_CTRL_WORD_K]
+            : 32u;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (int t = 0; t <= HTP_MAX_NTHREADS; t++) {

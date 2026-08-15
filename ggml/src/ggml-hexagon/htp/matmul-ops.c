@@ -109,6 +109,13 @@ struct htp_mm_context {
     int32_t  dbg_v111_int_dot;
     uint32_t dbg_v111_scales_fp16;   // low16=Q4 scale, high16=Q8 scale
 
+    // v10.12 runtime debug controls.
+    uint32_t dbg_v112_enabled;
+    int32_t  dbg_v112_want_expert;
+    uint32_t dbg_v112_want_ct;
+    uint32_t dbg_v112_want_cid;
+    uint32_t dbg_v112_want_k;
+
     void (*vec_dot_1x1)(const uint32_t n, float * restrict s0,
          const void * restrict vx0,
          const void * restrict vy0);
@@ -1358,7 +1365,18 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             // worker threads finish, so it cannot disturb execution parameters.
             // v10.6: Host reference hashes ct=0 (rows 0..31), so only the
             // DSP worker processing ct=0 may claim the debug slot.
-            if (ct == 0 &&
+            const bool dbg_ct_match = mmctx->dbg_v112_enabled
+                ? (ct == mmctx->dbg_v112_want_ct)
+                : (ct == 0);
+            const bool dbg_expert_match = mmctx->dbg_v112_enabled
+                ? (mmctx->dbg_v112_want_expert < 0 ||
+                   cur_a == (uint32_t) mmctx->dbg_v112_want_expert)
+                : true;
+            const bool dbg_cid_exists = mmctx->dbg_v112_enabled
+                ? (mmctx->dbg_v112_want_cid < (uint32_t) cne1)
+                : true;
+
+            if (dbg_ct_match && dbg_expert_match && dbg_cid_exists &&
                 __sync_bool_compare_and_swap(&mmctx->dbg_v103_claimed, 0, 1)) {
                 const size_t raw_bytes = (size_t) valid_rows * raw_row_size;
 
@@ -1412,7 +1430,8 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 float * restrict dst_row =
                     (float *) (dst->data + (rm1 * nb1 + rm2 * nb2));
 
-                if (ct == 0 && cid == 0 &&
+                if (ct == (mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_ct : 0u) &&
+                    cid == (mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_cid : 0u) &&
                     cur_a == mmctx->dbg_v103_expert &&
                     mmctx->dbg_v103_claimed) {
                     uint32_t fnv_dot = 2166136261u;
@@ -1430,13 +1449,24 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 //   - the original F32 activation row,
                 //   - the actual Q8 scale emitted by the HTP quantizer.
                 // The normal full-K result below is untouched.
-                if (ct == 0 && cid == 0 &&
+                const uint32_t dbg_target_ct =
+                    mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_ct : 0u;
+                const uint32_t dbg_target_cid =
+                    mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_cid : 0u;
+
+                if (ct == dbg_target_ct && cid == dbg_target_cid &&
                     cur_a == mmctx->dbg_v103_expert &&
                     mmctx->dbg_v103_claimed) {
+                    uint32_t dbg_k =
+                        mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_k : 32u;
+                    if (dbg_k > ne10) dbg_k = ne10;
+                    dbg_k = (dbg_k / 32u) * 32u;
+                    if (dbg_k < 32u) dbg_k = 32u;
+
                     float hvx_k32[32] __attribute__((aligned(128)));
                     memset(hvx_k32, 0, sizeof(hvx_k32));
                     tiled_vec_dot_q4_0_32x1(
-                        32, hvx_k32, tiled_buf, src1_col, valid_rows, NULL);
+                        dbg_k, hvx_k32, tiled_buf, src1_col, valid_rows, NULL);
 
                     const uint8_t * q4_block = raw_buf; // row 0, K tile 0
                     uint16_t q4_scale_u16 = 0;
@@ -1459,40 +1489,63 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                         (size_t) ir1 * nb11 +
                         (size_t) rm2 * nb12;
 
-                    int32_t int_dot = 0;
-                    const uint8_t * qs = q4_block + 2;
-                    for (uint32_t ki = 0; ki < 32; ++ki) {
-                        const int32_t qw =
-                            (int32_t) htp_raw_q4_0_get_nibble(qs, ki) - 8;
+                    float ref_total = 0.0f;
+                    int32_t first_int_dot = 0;
 
-                        float xf = 0.0f;
-                        memcpy(&xf, src1_orig_bytes + (size_t) ki * nb10, sizeof(xf));
+                    const uint32_t n_dbg_tiles = dbg_k / 32u;
+                    for (uint32_t dkt = 0; dkt < n_dbg_tiles; ++dkt) {
+                        const uint8_t * q4b = raw_buf + (size_t) dkt * 18u;
 
-                        // HTP Q8_0 tiled quantization first converts activation
-                        // values/scales through f16. Use the actual emitted Q8
-                        // scale and the same nearest-integer saturation model.
-                        const __fp16 xh = (__fp16) xf;
-                        int32_t qa = 0;
-                        if (q8_scale_f != 0.0f && isfinite(q8_scale_f)) {
-                            const float qf = (float) xh / q8_scale_f;
-                            qa = (int32_t) roundf(qf);
-                            if (qa > 127)  qa = 127;
-                            if (qa < -128) qa = -128;
+                        uint16_t q4s_u16 = 0;
+                        memcpy(&q4s_u16, q4b, sizeof(q4s_u16));
+                        __fp16 q4s_h;
+                        memcpy(&q4s_h, &q4s_u16, sizeof(q4s_h));
+
+                        const uint8_t * q8tile =
+                            src1_col + (size_t) dkt * HTP_MM_ACT_TILE_SIZE_Q8_0;
+                        uint16_t q8s_u16 = 0;
+                        memcpy(&q8s_u16, q8tile + 1024, sizeof(q8s_u16));
+                        __fp16 q8s_h;
+                        memcpy(&q8s_h, &q8s_u16, sizeof(q8s_h));
+                        const float q8s_f = (float) q8s_h;
+
+                        int32_t tile_int_dot = 0;
+                        const uint8_t * qs = q4b + 2;
+                        for (uint32_t kli = 0; kli < 32; ++kli) {
+                            const uint32_t ki = dkt * 32u + kli;
+                            const int32_t qw =
+                                (int32_t) htp_raw_q4_0_get_nibble(qs, kli) - 8;
+
+                            float xf = 0.0f;
+                            memcpy(&xf,
+                                src1_orig_bytes + (size_t) ki * nb10,
+                                sizeof(xf));
+
+                            const __fp16 xh = (__fp16) xf;
+                            int32_t qa = 0;
+                            if (q8s_f != 0.0f && isfinite(q8s_f)) {
+                                qa = (int32_t) roundf((float) xh / q8s_f);
+                                if (qa > 127)  qa = 127;
+                                if (qa < -128) qa = -128;
+                            }
+
+                            tile_int_dot += qw * qa;
                         }
 
-                        int_dot += qw * qa;
+                        if (dkt == 0) {
+                            first_int_dot = tile_int_dot;
+                        }
+                        ref_total +=
+                            (float) tile_int_dot * (float) q4s_h * q8s_f;
                     }
-
-                    const float ref_k32 =
-                        (float) int_dot * q4_scale_f * q8_scale_f;
 
                     union { float f; uint32_t u; } hvx_u, ref_u;
                     hvx_u.f = hvx_k32[0];
-                    ref_u.f = ref_k32;
+                    ref_u.f = ref_total;
 
                     mmctx->dbg_v111_hvx_k32_bits = hvx_u.u;
                     mmctx->dbg_v111_ref_k32_bits = ref_u.u;
-                    mmctx->dbg_v111_int_dot      = int_dot;
+                    mmctx->dbg_v111_int_dot      = first_int_dot;
                     mmctx->dbg_v111_scales_fp16  =
                         (uint32_t) q4_scale_u16 |
                         ((uint32_t) q8_scale_u16 << 16);
@@ -1504,7 +1557,8 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 // v10.8.1: this is the real raw-Q4_0 MMID dot scope.
                 // Capture only cid=0 / ct=0 so it corresponds to the same
                 // deterministic debug expert/tile used by v10.6/v10.7.
-                if (ct == 0 && cid == 0 &&
+                if (ct == (mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_ct : 0u) &&
+                    cid == (mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_cid : 0u) &&
                     cur_a == mmctx->dbg_v103_expert &&
                     mmctx->dbg_v103_claimed) {
                     union { float f; uint32_t u; } o0, o1, o2, o3;
@@ -4107,6 +4161,19 @@ int op_matmul_id(struct htp_ops_context * octx) {
     mmctx->mm_div_ne11          = kparams->div_ne11;
     mmctx->src0_row_size_padded = src0_row_size_padded;
     mmctx->src1_nrows           = src1_nrows;
+
+    // v10.12: the first 32 kernel-param words are the normal matmul payload.
+    // Extra words 32..37 carry runtime debug controls and are not used by compute.
+    const int32_t * dbg_ctrl_words = (const int32_t *) octx->kernel_params;
+    if ((uint32_t) dbg_ctrl_words[HTP_MM_DEBUG_CTRL_WORD_MAGIC] == HTP_MM_DEBUG_CTRL_MAGIC) {
+        mmctx->dbg_v112_enabled      = 1;
+        mmctx->dbg_v112_want_expert = dbg_ctrl_words[HTP_MM_DEBUG_CTRL_WORD_EXPERT];
+        mmctx->dbg_v112_want_ct      = (uint32_t) MAX(dbg_ctrl_words[HTP_MM_DEBUG_CTRL_WORD_CT], 0);
+        mmctx->dbg_v112_want_cid     = (uint32_t) MAX(dbg_ctrl_words[HTP_MM_DEBUG_CTRL_WORD_CID], 0);
+        uint32_t dk = (uint32_t) MAX(dbg_ctrl_words[HTP_MM_DEBUG_CTRL_WORD_K], 32);
+        dk = (dk / 32u) * 32u;
+        mmctx->dbg_v112_want_k = dk;
+    }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 

@@ -71,7 +71,7 @@ enum htp_mm_kernel_type {
 };
 
 // Op-specific struct for precomputed matmul params
-#define HTP_MM_DEBUG_RETURN_MAGIC HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC /* v10.11: dispatcher also returns first-K32 HTP/scalar comparison through htp_opbatch_rsp */
+#define HTP_MM_DEBUG_RETURN_MAGIC HTP_OPBATCH_DEBUG_RAW_Q4_0_MAGIC /* v10.12: runtime-configurable MMID debug driver; cumulative-K checkpoint selected at launch */
 
 struct htp_mm_kernel_params {
     int32_t  kernel_type;        // enum htp_mm_kernel_type
