@@ -258,7 +258,7 @@ struct htp_opbatch_rsp {
     uint32_t dbg_ir1;
     uint32_t dbg_src1_off;
 
-    // v10.8: post-dot output float bit patterns.
+    // v10.8.1: post-dot float bit patterns returned through dspqueue response.
     uint32_t dbg_out0;
     uint32_t dbg_out1;
     uint32_t dbg_out2;

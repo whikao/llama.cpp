@@ -87,7 +87,8 @@ struct htp_mm_context {
     uint32_t dbg_v107_ir1;
     uint32_t dbg_v107_src1_off;
 
-    // v10.8: first four post-dot output float bit patterns for the captured ct=0 row.
+    // v10.8.1: bit patterns of the first four outputs produced by the
+    // deterministic raw-Q4_0 dot call (expert captured by v10.6, ct=0, cid=0).
     uint32_t dbg_v108_out0;
     uint32_t dbg_v108_out1;
     uint32_t dbg_v108_out2;
@@ -1335,18 +1336,22 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
                 tiled_vec_dot_q4_0_32x1(
                     ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
-                // v10.8: capture output immediately after the first dot call for ct=0.
-                // No computation is modified; only float bit patterns are recorded.
-                if (ct == 0 && kt == 0 && mmctx->dbg_v103_claimed) {
-                    union { float f; uint32_t u; } d0, d1, d2, d3;
-                    d0.f = dst_col[0];
-                    d1.f = dst_col[1];
-                    d2.f = dst_col[2];
-                    d3.f = dst_col[3];
-                    mmctx->dbg_v108_out0 = d0.u;
-                    mmctx->dbg_v108_out1 = d1.u;
-                    mmctx->dbg_v108_out2 = d2.u;
-                    mmctx->dbg_v108_out3 = d3.u;
+
+                // v10.8.1: this is the real raw-Q4_0 MMID dot scope.
+                // Capture only cid=0 / ct=0 so it corresponds to the same
+                // deterministic debug expert/tile used by v10.6/v10.7.
+                if (ct == 0 && cid == 0 &&
+                    cur_a == mmctx->dbg_v103_expert &&
+                    mmctx->dbg_v103_claimed) {
+                    union { float f; uint32_t u; } o0, o1, o2, o3;
+                    o0.f = dst_row[0];
+                    o1.f = dst_row[1];
+                    o2.f = dst_row[2];
+                    o3.f = dst_row[3];
+                    mmctx->dbg_v108_out0 = o0.u;
+                    mmctx->dbg_v108_out1 = o1.u;
+                    mmctx->dbg_v108_out2 = o2.u;
+                    mmctx->dbg_v108_out3 = o3.u;
                 }
             }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
@@ -3983,10 +3988,15 @@ int op_matmul_id(struct htp_ops_context * octx) {
         dbg_kparams->vtcm_src3_size   = (int32_t) mmctx->dbg_v107_ir1;
         dbg_kparams->vtcm_dst_size    = (int32_t) mmctx->dbg_v107_src1_off;
 
-        dbg_kparams->raw_bytes        = (int32_t) mmctx->dbg_v108_out0;
-        dbg_kparams->raw_row_size     = (int32_t) mmctx->dbg_v108_out1;
-        dbg_kparams->raw_nrows        = (int32_t) mmctx->dbg_v108_out2;
-        dbg_kparams->raw_reserved     = (int32_t) mmctx->dbg_v108_out3;
+        // v10.8.1: kernel_params is a fixed 128-byte blob. The op has finished,
+        // so slots 17..20 are dead fastdiv storage and can safely carry debug
+        // output bits to main.c. Use the raw int32 view instead of nonexistent
+        // named struct fields.
+        int32_t * dbg_words = (int32_t *) dbg_kparams;
+        dbg_words[17] = (int32_t) mmctx->dbg_v108_out0;
+        dbg_words[18] = (int32_t) mmctx->dbg_v108_out1;
+        dbg_words[19] = (int32_t) mmctx->dbg_v108_out2;
+        dbg_words[20] = (int32_t) mmctx->dbg_v108_out3;
     }
 
     if (mapping_buf != octx->ctx->ddr_spad_base) {
