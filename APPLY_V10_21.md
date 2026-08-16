@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.24 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.25 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,11 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- Adds one `DBG_V125_HMX_RAW_PROFILE` record per raw-HMX `MUL_MAT_ID`
+  invocation. It reports accumulated microseconds for activation gather, raw
+  DMA, parallel raw-to-tiled conversion, tiled dequantization, HMX compute and
+  output scatter across all selected experts. The instrumentation does not
+  change tensor data or kernel selection.
 - Parallelizes the low-memory raw-Q4_0 to tiled transform added in v10.23.
   Independent 32-row weight tiles are now distributed across the existing HTP
   worker pool before the already-threaded dequantizer runs. The byte layout,
@@ -42,7 +47,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.24.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.25.tar.gz -C .
 git diff --check
 git status --short
 ```

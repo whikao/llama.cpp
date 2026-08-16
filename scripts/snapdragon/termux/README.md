@@ -126,7 +126,7 @@ GGML_HEXAGON_TRACE_START=blk.0.ffn_gate_exps
 GGML_HEXAGON_TRACE_COUNT=8
 ```
 
-The v10.24 low-memory HMX path keeps `GGML_HEXAGON_MMID_RAW_Q4_0=1`. It
+The v10.25 low-memory HMX path keeps `GGML_HEXAGON_MMID_RAW_Q4_0=1`. It
 converts only the current HMX weight chunk from raw GGUF Q4_0 into tiled form
 inside the two existing VTCM work areas. The independent 32-row layout
 transforms run on the existing HTP worker pool; the transformed bytes and HMX
@@ -163,6 +163,9 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
 - `mmid-summary.tsv`: counts for the `DBG_V120_MMID_SLICE` checkpoints, including finite source slices that produced nonfinite destination slices.
 - `DBG_V121_MMID_*` lines in the raw/debug trace: per-slice quantizer mode,
   source/Q8 fingerprints, expert/Q4 offsets and fingerprints, and exact dot outputs.
+- `DBG_V125_HMX_RAW_PROFILE` lines: accumulated raw-HMX phase timings for each
+  `MUL_MAT_ID`, including raw DMA, layout conversion, dequantization and HMX
+  compute.
 - `summary.md`: exit codes, the MMID table, build identity, phone identity, and active debug settings.
 - `share-this.tar.gz`: the small bundle to attach to the debugging chat.
 

@@ -4191,6 +4191,20 @@ static void transfer_output_chunk_scattered_threaded(
     (void) n_threads;
 }
 
+// v10.25: phase timings for the low-memory raw-Q4_0 HMX MMID path.  Values
+// are accumulated across all selected experts in one MUL_MAT_ID invocation
+// and printed as a single DBG line by the dispatcher.
+typedef struct {
+    uint64_t total_qt;
+    uint64_t activation_qt;
+    uint64_t raw_dma_qt;
+    uint64_t raw_to_tiled_qt;
+    uint64_t dequant_qt;
+    uint64_t hmx_qt;
+    uint64_t output_qt;
+    uint32_t expert_calls;
+} htp_hmx_raw_profile_t;
+
 static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                          float *restrict dst,
                                          const float *activation,
@@ -4205,7 +4219,12 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                          bool raw_q4_0,
                                          const struct mmid_row_mapping *matrix_rows,
                                          int cur_a,
-                                         int mapping_stride) {
+                                         int mapping_stride,
+                                         htp_hmx_raw_profile_t * profile) {
+    const uint64_t total_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
+    if (profile) {
+        profile->expert_calls++;
+    }
     struct htp_thread_trace * tr = &ctx->trace[0];
     htp_trace_event_start(tr, HTP_TRACE_EVT_INIT, 0);
 
@@ -4301,9 +4320,13 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
         const size_t n_rows = hex_smin(m_padded - mr, m_chunk_n_rows);
         const size_t n_row_tiles = hmx_ceil_div(n_rows, HTP_MM_HMX_TILE_N_ROWS);
 
+        uint64_t phase_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
         transfer_activation_chunk_gathered_threaded(
             ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
             matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_threads, k_valid);
+        if (profile) {
+            profile->activation_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+        }
 
         // A0: Pre-fetch the first already-tiled weight chunk (nc = 0).
         // Raw Q4_0 is loaded synchronously per chunk below because the raw
@@ -4334,15 +4357,23 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                     return -1;
                 }
 
+                phase_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
                 dma_queue_push(
                     ctx->dma[0],
                     dma_make_ptr(vtcm_scratch0, weight + nc * raw_row_size),
                     raw_row_size, raw_row_size, raw_row_size, n_cols);
                 uint8_t * raw_chunk = (uint8_t *) dma_queue_pop(ctx->dma[0]).dst;
+                if (profile) {
+                    profile->raw_dma_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+                }
                 uint8_t * tiled_chunk = (uint8_t *) vtcm_weight;
+                phase_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
                 htp_raw_q4_0_to_tiled_threaded(
                     ctx, raw_chunk, raw_row_size, tiled_chunk,
                     n_cols, (uint32_t) k, (uint32_t) n_threads);
+                if (profile) {
+                    profile->raw_to_tiled_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+                }
                 curr_tiled = vtcm_weight;
             } else {
                 // Wait for the already-tiled weight DMA queued above.
@@ -4350,11 +4381,15 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
             }
 
             // B: Weight Dequantize (Threaded)
+            phase_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
             dequantize_tiled_weight_chunk_to_fp16_tiles(
                 ctx, vtcm_scratch0, curr_tiled,
                 n_cols, k, row_stride, weight_type,
                 n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads
             );
+            if (profile) {
+                profile->dequant_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+            }
 
             // Start the next already-tiled DMA early. Raw Q4_0 cannot prefetch
             // here because vtcm_scratch0 now contains the current FP16 weights.
@@ -4367,17 +4402,28 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
             }
 
             // C: HMX Compute (Queue-based)
+            phase_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
             hmx_matmul_job_init(&job, vtcm_output, vtcm_f16_act, vtcm_scratch0, vtcm_scales, n_row_tiles, n_col_tiles, k / HTP_MM_HMX_TILE_N_ROWS);
             hmx_queue_push(ctx->hmx_queue, hmx_queue_make_desc(hmx_matmul_worker_fn, &job));
             hmx_queue_pop(ctx->hmx_queue);
+            if (profile) {
+                profile->hmx_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+            }
 
             // D: Output Store
+            phase_start_qt = profile ? HAP_perf_get_qtimer_count() : 0;
             transfer_output_chunk_scattered_threaded(
                 ctx, dst + nc, vtcm_output, (int) mr, (int) n_rows, (int) n_cols,
                 matrix_rows, cur_a, mapping_stride, dst_nb1, dst_nb2, cne1, n_threads);
+            if (profile) {
+                profile->output_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+            }
         }
     }
 
+    if (profile) {
+        profile->total_qt += HAP_perf_get_qtimer_count() - total_start_qt;
+    }
     return 0;
 }
 
@@ -4479,6 +4525,7 @@ static int hmx_mm_op_matmul_id(
     const int n_ids = octx->src[2]->ne[0];
     const int n_as  = ne02;
     const bool raw_q4_0 = kparams->kernel_type == HTP_MM_KERNEL_HMX_2D_RAW_Q4_0;
+    htp_hmx_raw_profile_t raw_profile = {0};
 
     for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
@@ -4493,11 +4540,25 @@ static int hmx_mm_op_matmul_id(
                                    nb1, nb2,
                                    (int) src0->nb[1], (int) src0->type,
                                    raw_q4_0,
-                                   matrix_rows, cur_a, mmctx->mapping_stride);
+                                   matrix_rows, cur_a, mmctx->mapping_stride,
+                                   raw_q4_0 ? &raw_profile : NULL);
         if (ret != 0) {
             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);
             return HTP_STATUS_NO_SUPPORT;
         }
+    }
+
+    if (raw_q4_0) {
+        FARF(HIGH,
+             "DBG_V125_HMX_RAW_PROFILE experts=%u total_us=%u activation_us=%u raw_dma_us=%u raw_to_tiled_us=%u dequant_us=%u hmx_us=%u output_us=%u",
+             raw_profile.expert_calls,
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.total_qt),
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.activation_qt),
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.raw_dma_qt),
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.raw_to_tiled_qt),
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.dequant_qt),
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.hmx_qt),
+             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.output_qt));
     }
 
     return HTP_STATUS_OK;
