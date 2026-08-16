@@ -73,6 +73,10 @@ struct htp_ops_context {
     // offsets and fingerprints.  The worker claims one record per rm2 slice.
     struct htp_mmid_slice_trace_record * dbg_mmid_slice_trace;
     volatile uint32_t                    dbg_mmid_slice_claimed;
+
+    // v10.25.2: one-op raw-HMX phase totals, consumed by process_opbatch()
+    // immediately after proc_op_req() returns.
+    struct htp_hmx_raw_profile_record    dbg_hmx_raw_profile;
 };
 
 // Main context for htp DSP backend

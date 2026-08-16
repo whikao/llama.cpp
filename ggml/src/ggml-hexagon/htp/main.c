@@ -1276,6 +1276,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     bool dbg_mmid_slice_captured = false;
     struct htp_mmid_slice_trace_record dbg_mmid_slice[HTP_MMID_SLICE_TRACE_MAX];
     memset(dbg_mmid_slice, 0, sizeof(dbg_mmid_slice));
+    struct htp_hmx_raw_profile_record dbg_hmx_raw_profile;
+    memset(&dbg_hmx_raw_profile, 0, sizeof(dbg_hmx_raw_profile));
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1300,7 +1302,25 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             octx->dbg_mmid_slice_claimed = 0;
         }
 
+        memset(&octx->dbg_hmx_raw_profile, 0, sizeof(octx->dbg_hmx_raw_profile));
         op_status = proc_op_req(octx, tens, i, &ops[i]);
+
+        // v10.25.2: aggregate all raw-HMX MMID phase totals in this batch and
+        // return them through the same coherent dspqueue response used by the
+        // existing slice diagnostics.
+        if (octx->dbg_hmx_raw_profile.valid) {
+            const struct htp_hmx_raw_profile_record * src = &octx->dbg_hmx_raw_profile;
+            dbg_hmx_raw_profile.valid = 1;
+            dbg_hmx_raw_profile.op_count        += src->op_count;
+            dbg_hmx_raw_profile.expert_calls    += src->expert_calls;
+            dbg_hmx_raw_profile.total_us        += src->total_us;
+            dbg_hmx_raw_profile.activation_us   += src->activation_us;
+            dbg_hmx_raw_profile.raw_dma_us      += src->raw_dma_us;
+            dbg_hmx_raw_profile.raw_to_tiled_us += src->raw_to_tiled_us;
+            dbg_hmx_raw_profile.dequant_us      += src->dequant_us;
+            dbg_hmx_raw_profile.hmx_us          += src->hmx_us;
+            dbg_hmx_raw_profile.output_us       += src->output_us;
+        }
 
         // Never leave a stack-backed trace pointer armed for a later op.
         octx->dbg_mmid_slice_trace = NULL;
@@ -1458,6 +1478,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     memcpy(rsp.dbg_trace, dbg_trace, sizeof(dbg_trace));
     rsp.dbg_mmid_slice_count = dbg_mmid_slice_count;
     memcpy(rsp.dbg_mmid_slice, dbg_mmid_slice, sizeof(dbg_mmid_slice));
+    rsp.dbg_hmx_raw_profile = dbg_hmx_raw_profile;
     rsp.dbg_full_ref_bits = dbg_full_ref_bits;
     memcpy(rsp.dbg_q8_actual, dbg_q8_actual, sizeof(dbg_q8_actual));
     memcpy(rsp.dbg_q8_scalar, dbg_q8_scalar, sizeof(dbg_q8_scalar));

@@ -348,6 +348,21 @@ struct htp_mmid_slice_trace_record {
     uint32_t dot_out0, dot_out1, dot_out2, dot_out3;
 };
 
+// v10.25.2: DSP -> host phase totals for low-memory raw-Q4_0 HMX MMID.
+// Times are converted to microseconds on DSP before transport.
+struct htp_hmx_raw_profile_record {
+    uint32_t valid;
+    uint32_t op_count;
+    uint32_t expert_calls;
+    uint32_t total_us;
+    uint32_t activation_us;
+    uint32_t raw_dma_us;
+    uint32_t raw_to_tiled_us;
+    uint32_t dequant_us;
+    uint32_t hmx_us;
+    uint32_t output_us;
+};
+
 struct htp_opbatch_rsp {
     uint32_t id;         // Batch id
     uint32_t status;     // HTP_STATUS_...
@@ -424,6 +439,7 @@ struct htp_opbatch_rsp {
     struct htp_postop_trace_record dbg_trace[HTP_POSTOP_TRACE_MAX_RECORDS];
     uint32_t dbg_mmid_slice_count;
     struct htp_mmid_slice_trace_record dbg_mmid_slice[HTP_MMID_SLICE_TRACE_MAX];
+    struct htp_hmx_raw_profile_record dbg_hmx_raw_profile;
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };

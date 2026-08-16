@@ -4549,16 +4549,17 @@ static int hmx_mm_op_matmul_id(
     }
 
     if (raw_q4_0) {
-        FARF(ALWAYS,
-             "DBG_V125_HMX_RAW_PROFILE experts=%u total_us=%u activation_us=%u raw_dma_us=%u raw_to_tiled_us=%u dequant_us=%u hmx_us=%u output_us=%u",
-             raw_profile.expert_calls,
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.total_qt),
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.activation_qt),
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.raw_dma_qt),
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.raw_to_tiled_qt),
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.dequant_qt),
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.hmx_qt),
-             (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.output_qt));
+        struct htp_hmx_raw_profile_record * out = &octx->dbg_hmx_raw_profile;
+        out->valid           = 1;
+        out->op_count        = 1;
+        out->expert_calls    = raw_profile.expert_calls;
+        out->total_us        = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.total_qt);
+        out->activation_us   = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.activation_qt);
+        out->raw_dma_us      = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.raw_dma_qt);
+        out->raw_to_tiled_us = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.raw_to_tiled_qt);
+        out->dequant_us      = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.dequant_qt);
+        out->hmx_us          = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.hmx_qt);
+        out->output_us       = (uint32_t) HAP_perf_qtimer_count_to_us(raw_profile.output_qt);
     }
 
     return HTP_STATUS_OK;

@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.25.1 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.25.2 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -14,6 +14,10 @@ v10.21 note instead of leaving another stale file.
 - v10.25.1 emits that record at the DSP `ALWAYS` level. The first v10.25
   build used `HIGH`, which is filtered by the release DSP logging mask and
   therefore produced no profile records even though inference succeeded.
+- v10.25.2 transports the phase totals in the coherent `dspqueue` response and
+  prints them on the Android host. The phone does not route DSP FARF output to
+  `llama-cli` stdout even at `ALWAYS`; the response path is the same verified
+  channel already used by the v10.20/v10.21 slice records.
 - Parallelizes the low-memory raw-Q4_0 to tiled transform added in v10.23.
   Independent 32-row weight tiles are now distributed across the existing HTP
   worker pool before the already-threaded dequantizer runs. The byte layout,
@@ -50,7 +54,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.25.1.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.25.2.tar.gz -C .
 git diff --check
 git status --short
 ```

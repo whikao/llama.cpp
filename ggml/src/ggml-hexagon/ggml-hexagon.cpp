@@ -1963,6 +1963,18 @@ struct ggml_hexagon_opqueue {
             }
         }
 
+        // v10.25.2 low-memory raw-HMX phase totals returned by DSP.
+        if (rsp.dbg_hmx_raw_profile.valid) {
+            const auto & p = rsp.dbg_hmx_raw_profile;
+            GGML_LOG_INFO(
+                "DBG_V125_HMX_RAW_PROFILE: dev=%s batch=%u ops=%u experts=%u "
+                "total_us=%u activation_us=%u raw_dma_us=%u "
+                "raw_to_tiled_us=%u dequant_us=%u hmx_us=%u output_us=%u\n",
+                shm_buf->sess->c_name(), rsp.id, p.op_count, p.expert_calls,
+                p.total_us, p.activation_us, p.raw_dma_us,
+                p.raw_to_tiled_us, p.dequant_us, p.hmx_us, p.output_us);
+        }
+
         // v10.19 generic post-op trace.
         if (rsp.dbg_trace_count > 0) {
             const auto & cached_ops = op_cache[rsp.id];
