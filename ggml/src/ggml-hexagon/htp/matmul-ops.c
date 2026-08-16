@@ -1259,32 +1259,62 @@ static void htp_raw_q4_0_32rows_to_tiled(
         // read from the wrong address.
         uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
 
-        // Logical Q4_0 data occupies 576 bytes; clear the 64-byte alignment tail.
-        memset(tile, 0, HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0);
+        // v10.26: walk each raw block once instead of revisiting it through 16
+        // column-pair passes. A raw Q4_0 byte contains q[j] in its low nibble
+        // and q[j + 16] in its high nibble, so one adjacent-byte load produces
+        // both the low-K and high-K tiled bytes. Full 32-row tiles are handled
+        // two rows at a time and written as aligned halfwords. This cuts the
+        // scalar Q-byte loads by 4x and avoids clearing the 576 bytes that are
+        // immediately overwritten. Only scales plus the alignment tail need a
+        // zero fill; partial-row tiles initialize their missing Q rows to 0x88.
+        if (valid_rows < 32) {
+            memset(tile, 0x88, 512);
+        }
+        uint8_t * scale_dst = tile + 512;
+        memset(scale_dst, 0, HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 - 512);
 
-        for (uint32_t cp = 0; cp < 16; ++cp) {
-            for (uint32_t row = 0; row < 32; ++row) {
-                uint8_t packed = 0x88; // zero in q4_0's biased nibble representation
-                if (row < valid_rows) {
-                    const uint8_t * block = raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
-                    const uint8_t * qs = block + 2; // fp16 scale occupies first 2 bytes
-                    const uint8_t q0 = htp_raw_q4_0_get_nibble(qs, 2 * cp + 0);
-                    const uint8_t q1 = htp_raw_q4_0_get_nibble(qs, 2 * cp + 1);
-                    packed = (uint8_t) (q0 | (q1 << 4));
-                }
-                tile[cp * 32 + row] = packed;
+        uint32_t row = 0;
+        for (; row + 1 < valid_rows; row += 2) {
+            const uint8_t * block0 = raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
+            const uint8_t * block1 = block0 + raw_row_size;
+            const uint8_t * qs0 = block0 + 2;
+            const uint8_t * qs1 = block1 + 2;
+
+            memcpy(scale_dst + 2 * row, block0, 2);
+            memcpy(scale_dst + 2 * row + 2, block1, 2);
+
+            #pragma unroll(8)
+            for (uint32_t qp = 0; qp < 8; ++qp) {
+                uint16_t pair0;
+                uint16_t pair1;
+                memcpy(&pair0, qs0 + 2 * qp, sizeof(pair0));
+                memcpy(&pair1, qs1 + 2 * qp, sizeof(pair1));
+
+                const uint8_t lo0 = (uint8_t) ((pair0 & 0x000f) | ((pair0 >> 4) & 0x00f0));
+                const uint8_t lo1 = (uint8_t) ((pair1 & 0x000f) | ((pair1 >> 4) & 0x00f0));
+                const uint8_t hi0 = (uint8_t) (((pair0 >> 4) & 0x000f) | ((pair0 >> 8) & 0x00f0));
+                const uint8_t hi1 = (uint8_t) (((pair1 >> 4) & 0x000f) | ((pair1 >> 8) & 0x00f0));
+                const uint16_t lo_rows = (uint16_t) lo0 | ((uint16_t) lo1 << 8);
+                const uint16_t hi_rows = (uint16_t) hi0 | ((uint16_t) hi1 << 8);
+
+                memcpy(tile + qp * 32 + row, &lo_rows, sizeof(lo_rows));
+                memcpy(tile + (qp + 8) * 32 + row, &hi_rows, sizeof(hi_rows));
             }
         }
 
-        uint8_t * scale_dst = tile + 512;
-        for (uint32_t row = 0; row < 32; ++row) {
-            if (row < valid_rows) {
-                const uint8_t * block = raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
-                scale_dst[2 * row + 0] = block[0];
-                scale_dst[2 * row + 1] = block[1];
-            } else {
-                scale_dst[2 * row + 0] = 0;
-                scale_dst[2 * row + 1] = 0;
+        if (row < valid_rows) {
+            const uint8_t * block = raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
+            const uint8_t * qs = block + 2;
+            memcpy(scale_dst + 2 * row, block, 2);
+
+            #pragma unroll(8)
+            for (uint32_t qp = 0; qp < 8; ++qp) {
+                uint16_t pair;
+                memcpy(&pair, qs + 2 * qp, sizeof(pair));
+                tile[qp * 32 + row] =
+                    (uint8_t) ((pair & 0x000f) | ((pair >> 4) & 0x00f0));
+                tile[(qp + 8) * 32 + row] =
+                    (uint8_t) (((pair >> 4) & 0x000f) | ((pair >> 8) & 0x00f0));
             }
         }
     }

@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.25.2 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.26 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,17 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.26 optimizes the measured bottleneck without changing the Q4_0 bytes
+  consumed by the existing dequantizer. The raw-to-tiled converter now walks
+  each raw row once, reuses each adjacent Q-byte pair for both K halves, writes
+  two output rows per halfword, and avoids clearing the 576 logical tile bytes
+  that a full tile immediately overwrites. The old and new transforms match
+  byte-for-byte across full and partial-row tests.
+- The v10.25.2 phone profile contained 135 raw-HMX MMID records and 4,797
+  selected-expert calls. Of 43.062 seconds measured inside MMID, raw-to-tiled
+  conversion consumed 42.784 seconds (99.354%). Raw DMA was 0.333%, tiled
+  dequantization 0.165%, and HMX compute only 0.035%. The v10.26 change is
+  deliberately limited to that 99.354% phase.
 - Adds one `DBG_V125_HMX_RAW_PROFILE` record per raw-HMX `MUL_MAT_ID`
   invocation. It reports accumulated microseconds for activation gather, raw
   DMA, parallel raw-to-tiled conversion, tiled dequantization, HMX compute and
@@ -54,7 +65,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.25.2.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.26.tar.gz -C .
 git diff --check
 git status --short
 ```
