@@ -1495,6 +1495,7 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     // uses this matrix worker rather than hvx_mv_id_raw_q4_0().  Keep the
     // probe shape-specific so prompt/gate/up work is not perturbed.
     const bool profile_down =
+        mmctx->dbg_v112_enabled &&
         ne00 == 768 && ne01 == 2048 && mmctx->src1_nrows == 8;
     mmctx->dbg_v138_worker_qt[ith] = 0;
     mmctx->dbg_v138_dma_qt[ith] = 0;
@@ -1516,7 +1517,8 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
     // v10.9: hvx_mm_run_quant_task() does not return until quant_barrier == 0,
     // so vtcm_src1 is fully produced here. Capture only ith==0 to avoid races.
-    if (ith == 0 && mmctx->vtcm_src1 && mmctx->vtcm_src1_stride >= 1152) {
+    if (mmctx->dbg_v112_enabled && ith == 0 &&
+        mmctx->vtcm_src1 && mmctx->vtcm_src1_stride >= 1152) {
         const uint8_t * q = mmctx->vtcm_src1;
 
         uint32_t fnv_tile = 2166136261u;
@@ -1630,7 +1632,8 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 ? (mmctx->dbg_v112_want_cid < (uint32_t) cne1)
                 : true;
 
-            if (dbg_ct_match && dbg_expert_match && dbg_cid_exists &&
+            if (mmctx->dbg_v112_enabled &&
+                dbg_ct_match && dbg_expert_match && dbg_cid_exists &&
                 __sync_bool_compare_and_swap(&mmctx->dbg_v103_claimed, 0, 1)) {
                 const size_t raw_bytes = (size_t) valid_rows * raw_row_size;
 
@@ -4841,7 +4844,8 @@ static int hvx_mm_matmul_id(
 
     worker_pool_run_func(octx->ctx->worker_pool, hvx_mmid_task_func, mmctx, octx->n_threads);
 
-    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0 &&
+    if (mmctx->dbg_v112_enabled &&
+        kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0 &&
         src1_nrows == 8 && ne00 == 768 && ne01 == 2048) {
         uint64_t worker_qt = 0;
         uint64_t wall_qt = 0;

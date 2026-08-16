@@ -193,6 +193,13 @@ kernel unchanged and adds `DBG_V132_HOST_SET`, `HOST_GET`, `HOST_GRAPH` and
 `HOST_SYNC` elapsed-time records. They identify whether the next target is
 sparse expert transfer, graph execution or synchronization.
 
+The v10.38 corrected phase probe captured 297 real `768:8` down calls. Across
+them, raw-to-tiled conversion used 60.58% of summed worker time and residual
+work used 26.85%. v10.39 gates the legacy raw-MMID hashes/scalar references and
+the v10.38 timers behind the existing MMID debug control. With
+`MMID_DEBUG=0`, normal inference now pays neither diagnostic cost; computation
+and tensor bytes are unchanged.
+
 The v10.32 phone timing identified sparse expert staging as the next target:
 3,453 raw-Q4_0 `SET` calls copied 4,069.39 MiB in 3.405688 seconds, while all
 explicit synchronization used only 0.071097 seconds. v10.33 keeps the model
