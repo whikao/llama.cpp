@@ -105,6 +105,7 @@ The main environment variables are:
 | `HOST_COPY_THREADS` | `4` | Parallel raw-Q4_0 expert staging workers; `0` or `1` restores synchronous copies |
 | `ROUTE_PROFILE` | `0` | Set to `1` only to measure per-layer MoE expert locality |
 | `EXPERT_COPY_CACHE` | `0` | Exact-address expert-copy reuse; set to `1` only for the v10.35 test |
+| `PROFILE_MODE` | `0` | Built-in HTP operator profiler; use `1` for the short v10.35.2 diagnostic |
 | `TRACE_START` | `blk.0.ffn_gate_exps` | Hexagon trace start tensor |
 | `TRACE_COUNT` | `8` | Trace checkpoint count |
 | `DEBUG_K` | `192` | Hexagon debug K value |
@@ -123,6 +124,7 @@ GGML_HEXAGON_NHMX=1
 GGML_HEXAGON_HOST_COPY_THREADS=4
 GGML_HEXAGON_ROUTE_PROFILE=0
 GGML_HEXAGON_EXPERT_COPY_CACHE=0
+GGML_HEXAGON_PROFILE=0
 GGML_HEXAGON_MMID_RAW_Q4_0=1
 GGML_HEXAGON_HOSTBUF=1
 GGML_HEXAGON_VERBOSE=1
@@ -232,6 +234,31 @@ but its `0/0` cache reports came from the temporary backend used during backend
 discovery, before the real copy workers started. v10.35.1 leaves the cache
 algorithm unchanged and ignores empty early reports so the final inference
 backend emits the accumulated counters.
+
+v10.35.1 measured only 16 hits among 38,858 expert copies: a 0.037% byte hit
+rate. Exact-address reuse is therefore rejected and should remain disabled.
+v10.35.2 changes only the Termux capture helper, exposing the backend's existing
+operator profiler as `PROFILE_MODE` and retaining its `profile-op` lines in the
+small share archive. It reuses the already-installed v10.35.1 binary; no
+GitHub Actions rebuild is needed. One short run is enough to rank the remaining
+HTP operators:
+
+```bash
+PROMPT='请用一句话介绍你自己。' TOKENS=8 HOST_COPY_THREADS=4 \
+EXPERT_COPY_CACHE=0 ROUTE_PROFILE=0 PROFILE_MODE=1 \
+GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
+  "$HOME/phone-debug.sh" run htp --seed 1234 --temp 0
+```
+
+That profile also corrected the next target. `ffn_down_exps` is Q4_1 only in
+layers 0--5; layers 6--47 are raw Q4_0 and accounted for about 1.393 seconds of
+the measured down path. The common one-token raw-Q4_0 down call averaged
+3.04 ms, versus about 0.85 and 0.83 ms for gate and up. Since one-token decode
+is below the HMX row threshold, v10.36 optimizes `hvx_mv_id_raw_q4_0`: the raw
+VTCM layout now uses the existing `n_prefetch` selection as a ring of raw and
+converted 32-row slots. DDR DMA for future slots overlaps conversion and dot
+work for the current slot. It adds no threads, changes no tensor bytes, and is
+not the model-sized HTP_REPACK route.
 
 Run exactly one initial v10.35 validation:
 

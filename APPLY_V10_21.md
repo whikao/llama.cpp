@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.35.1 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.36 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,27 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.36 uses the v10.35.2 operator profile to target single-token decode.
+  The model is mixed by layer: `ffn_down_exps` is Q4_1 only in layers 0--5,
+  while layers 6--47 use raw Q4_0. Those raw-Q4_0 down calls consumed about
+  1.393 seconds of the 8-token profile and averaged 3.04 ms for the common
+  one-token slice. Decode does not select HMX because its M dimension is below
+  the existing HMX threshold, so the relevant worker is
+  `hvx_mv_id_raw_q4_0`, not the HMX prompt worker.
+- The raw HVX VTCM layout now honors the already-selected `n_prefetch` value.
+  Each worker owns matching rings of raw and converted 32-row chunks. It queues
+  the initial DDR reads, converts each completed raw slot, reuses that raw slot
+  for a future DMA, and performs the current tiled dot while that DMA is in
+  flight. Tensor bytes, quantization, output equations and thread count are
+  unchanged. This is a bounded VTCM working-set increase, not a model-sized
+  repack or another Android allocation.
+- v10.35.2 is a helper-only profiling step and does not need another Android
+  build. v10.35.1 measured 16 hits among 38,858 expert copies (0.037% by
+  bytes), so exact-address reuse is rejected and remains disabled. The helper
+  now exposes the backend's existing operator profiler as `PROFILE_MODE=0..3`,
+  records it in metadata and retains `profile-op` lines in `share-this.tar.gz`.
+  A short 8-token mode-1 run will rank the remaining HTP costs before another
+  source optimization is selected.
 - v10.35.1 fixes reporting only. The first phone run was correct and coherent
   (exit `0`, 32 generated tokens, 1.68 t/s), but backend discovery freed a
   temporary backend before expert staging began. That emitted four premature
@@ -182,38 +203,36 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.35.1.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.36.tar.gz -C .
 git diff --check
 git status --short
 ```
 
-Inspect and publish the change using your normal Git workflow, then start the
-existing Android Hexagon workflow. After the workflow succeeds, refresh the
-phone helper and install the new rolling release:
+This version changes DSP source and therefore needs one GitHub Actions build.
+Stage, commit and push the files shown by `git status`, then run the usual
+Android Hexagon workflow. After it succeeds, install the new rolling release:
 
 ```bash
-install -m 700 \
-  "$HOME/whikao-llama.cpp/scripts/snapdragon/termux/phone-debug.sh" \
-  "$HOME/phone-debug.sh"
-
 "$HOME/phone-debug.sh" install
+"$HOME/phone-debug.sh" status
 ```
 
-Run one deterministic v10.35 cache validation. Disabling the older route,
-verbose and tensor-slice traces keeps this measurement lightweight:
+Run one deterministic 32-token comparison with profiling disabled. The
+rejected exact-address cache stays off and four host-copy workers remain the
+normal setting:
 
 ```bash
 termux-wake-lock
 PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
-EXPERT_COPY_CACHE=1 ROUTE_PROFILE=0 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
+EXPERT_COPY_CACHE=0 ROUTE_PROFILE=0 PROFILE_MODE=0 \
+GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
   "$HOME/phone-debug.sh" run htp --seed 1234 --temp 0
 ```
 
-Attach the generated `share-this.tar.gz`. The text must remain coherent, the
-run must exit `0`, and the finite checks must stay clean. The
-`DBG_V135_EXPERT_COPY_CACHE` byte hit rate and timings determine whether this
-optimization stays. It uses only a small metadata table, not another model
-weight cache.
+Attach the generated `share-this.tar.gz`. Compare its ordinary wall time and
+generated text with the v10.35.1 control: prompt 4.870 s, generation 32 tokens
+in 18.391 s (1.74 t/s), total 23.384 s. Eight host-copy workers remain an
+optional later burst test; do not mix that variable into this first comparison.
 
 For ordinary runs leave `ROUTE_PROFILE=0` and `EXPERT_COPY_CACHE=0`. If the
 cache test is wrong or slower, leave it at zero. If parallel copying is wrong

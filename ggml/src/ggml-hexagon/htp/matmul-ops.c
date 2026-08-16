@@ -2221,6 +2221,12 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     htp_matmul_preamble;
 
     const struct htp_tensor * restrict ids = octx->src[2];
+    const struct htp_mm_kernel_params * kparams =
+        (const struct htp_mm_kernel_params *) octx->kernel_params;
+    const uint32_t n_prefetch = kparams->n_prefetch;
+    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH &&
+           (n_prefetch & (n_prefetch - 1)) == 0);
+    const uint32_t prefetch_mask = n_prefetch - 1;
     const uint32_t src0_nrows      = ne01;
     const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
@@ -2235,8 +2241,10 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     uint8_t * restrict thread_vtcm = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
     const size_t raw_row_size = nb01;
     const size_t raw_32_size = htp_mm_round_up(32 * raw_row_size, 256);
+    const size_t tiled_32_size = htp_mm_round_up(
+        (ne00 / 32) * htp_mm_get_weight_aligned_tile_size(HTP_TYPE_Q4_0), 256);
     uint8_t * restrict raw_buf = thread_vtcm;
-    uint8_t * restrict tiled_buf = thread_vtcm + raw_32_size;
+    uint8_t * restrict tiled_buf = thread_vtcm + n_prefetch * raw_32_size;
     const uint8_t * restrict src1_col = mmctx->vtcm_src1;
 
     const uint32_t n_aids = ids->ne[0];
@@ -2252,21 +2260,49 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
         const uint32_t ct_start = src0_start_row / 32;
         const uint32_t ct_end   = (src0_end_row + 31) / 32;
+
+        // v10.36: fill a per-thread DMA ring first.  Once a raw slot has been
+        // converted, immediately reuse it for the next future chunk while
+        // the current tiled chunk is consumed by HVX.  Raw and tiled rings
+        // are disjoint, so the overlap cannot overwrite the active dot data.
+        uint32_t push_ct = ct_start;
+        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; ++d, ++push_ct) {
+            const uint32_t slot = push_ct & prefetch_mask;
+            uint32_t valid_rows = ne01 - push_ct * 32;
+            valid_rows = MIN(valid_rows, 32u);
+            dma_queue_push(
+                dma_queue,
+                dma_make_ptr(raw_buf + (size_t) slot * raw_32_size,
+                             src0_expert + (size_t) push_ct * 32 * raw_row_size),
+                raw_row_size, raw_row_size, raw_row_size, valid_rows);
+        }
+
         for (uint32_t ct = ct_start; ct < ct_end; ++ct) {
             uint32_t valid_rows = ne01 - ct * 32;
             valid_rows = MIN(valid_rows, 32u);
 
-            dma_queue_push(
-                dma_queue,
-                dma_make_ptr(raw_buf, src0_expert + (size_t) ct * 32 * raw_row_size),
-                raw_row_size, raw_row_size, raw_row_size, valid_rows);
+            const uint32_t slot = ct & prefetch_mask;
+            uint8_t * restrict raw_tile = raw_buf + (size_t) slot * raw_32_size;
+            uint8_t * restrict tiled_tile = tiled_buf + (size_t) slot * tiled_32_size;
             (void) dma_queue_pop(dma_queue);
 
-            htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+            htp_raw_q4_0_32rows_to_tiled(
+                raw_tile, raw_row_size, tiled_tile, ne00, valid_rows);
+
+            if (push_ct < ct_end) {
+                uint32_t next_valid_rows = ne01 - push_ct * 32;
+                next_valid_rows = MIN(next_valid_rows, 32u);
+                dma_queue_push(
+                    dma_queue,
+                    dma_make_ptr(raw_tile,
+                                 src0_expert + (size_t) push_ct * 32 * raw_row_size),
+                    raw_row_size, raw_row_size, raw_row_size, next_valid_rows);
+                ++push_ct;
+            }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
             tiled_vec_dot_q4_0_32x1(
-                ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+                ne10, &dst_row[ct * 32], tiled_tile, src1_col, valid_rows, NULL);
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
         }
     }
