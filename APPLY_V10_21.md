@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.35 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.35.1 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,13 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.35.1 fixes reporting only. The first phone run was correct and coherent
+  (exit `0`, 32 generated tokens, 1.68 t/s), but backend discovery freed a
+  temporary backend before expert staging began. That emitted four premature
+  `0/0` cache reports and consumed the one-shot flag. Empty reports no longer
+  mark cache or route statistics as printed, and unchanged duplicate reports
+  remain suppressed. Cache matching, invalidation and inference math are
+  unchanged from v10.35.
 - v10.35 uses the completed 48-layer route trace to avoid a costly static
   cache. Across 29 decode transitions, adjacent-token route overlap was
   49.60%, but a static top-8 expert cache covered only 52.13% and would retain
@@ -175,7 +182,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.35.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.35.1.tar.gz -C .
 git diff --check
 git status --short
 ```

@@ -489,7 +489,9 @@ struct ggml_hexagon_session {
     uint64_t                                    expert_copy_cache_misses = 0;
     uint64_t                                    expert_copy_cache_hit_bytes = 0;
     uint64_t                                    expert_copy_cache_miss_bytes = 0;
-    bool                                        expert_copy_cache_printed = false;
+    uint64_t                                    expert_copy_cache_reported_hits = 0;
+    uint64_t                                    expert_copy_cache_reported_misses = 0;
+    bool                                        expert_copy_cache_reported = false;
 
     uint32_t n_threads = 0;
     uint32_t n_hvx     = 0;
@@ -1433,6 +1435,11 @@ void ggml_hexagon_session::print_moe_route_profile() {
     if (this->route_profile_printed) {
         return;
     }
+    // Backend discovery creates and frees a temporary backend before the
+    // inference backend starts.  Do not consume the one-shot report there.
+    if (this->route_profile_layers.empty()) {
+        return;
+    }
     this->route_profile_printed = true;
 
     std::vector<int> layers;
@@ -1603,11 +1610,20 @@ void ggml_hexagon_session::print_expert_copy_cache_stats() {
     }
 
     std::lock_guard<std::mutex> lock(this->expert_copy_cache_mutex);
-    if (this->expert_copy_cache_printed) {
+    const uint64_t copies = this->expert_copy_cache_hits + this->expert_copy_cache_misses;
+    if (copies == 0) {
+        // Backend discovery releases a temporary backend before any expert
+        // staging.  Keep the report live for the real inference backend.
         return;
     }
-    this->expert_copy_cache_printed = true;
-    const uint64_t copies = this->expert_copy_cache_hits + this->expert_copy_cache_misses;
+    if (this->expert_copy_cache_reported &&
+        this->expert_copy_cache_reported_hits == this->expert_copy_cache_hits &&
+        this->expert_copy_cache_reported_misses == this->expert_copy_cache_misses) {
+        return;
+    }
+    this->expert_copy_cache_reported = true;
+    this->expert_copy_cache_reported_hits = this->expert_copy_cache_hits;
+    this->expert_copy_cache_reported_misses = this->expert_copy_cache_misses;
     const uint64_t bytes = this->expert_copy_cache_hit_bytes + this->expert_copy_cache_miss_bytes;
     GGML_LOG_INFO(
         "DBG_V135_EXPERT_COPY_CACHE: dev=%s hits=%" PRIu64 " misses=%" PRIu64

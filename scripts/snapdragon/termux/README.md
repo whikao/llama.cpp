@@ -227,6 +227,12 @@ Ordinary host writes, DSP graph outputs and overlapping replacements invalidate
 entries. `DBG_V135_EXPERT_COPY_CACHE` reports the measured copy and byte hit
 rates; the feature remains off by default.
 
+The first v10.35 phone run completed correctly and generated coherent text,
+but its `0/0` cache reports came from the temporary backend used during backend
+discovery, before the real copy workers started. v10.35.1 leaves the cache
+algorithm unchanged and ignores empty early reports so the final inference
+backend emits the accumulated counters.
+
 Run exactly one initial v10.35 validation:
 
 ```bash
