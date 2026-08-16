@@ -6,10 +6,13 @@
 #include <time.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <utility>
+#include <vector>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -76,6 +79,9 @@ static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
 static int    opt_mmid_raw_q4_0 = 0; // EXPERIMENTAL: keep Q4_0 MUL_MAT_ID weights on host; scheduler stages raw copies
 static size_t opt_host_copy_threads = 4; // v10.33: parallel host copies for sparse raw-Q4_0 expert staging
+static int    opt_route_profile = 0; // v10.34: profile MoE route locality without changing execution
+
+static constexpr size_t GGML_HEXAGON_ROUTE_MAX_EXPERTS = 256;
 
 // v10.12 runtime MMID debug driver. Change these environment variables between
 // runs; no rebuild is required.
@@ -410,6 +416,17 @@ struct ggml_hexagon_session {
         size_t       size;
     };
 
+    struct route_layer_stats {
+        std::array<uint64_t, GGML_HEXAGON_ROUTE_MAX_EXPERTS> expert_counts{};
+        std::array<int32_t, 8> last_experts{};
+        uint64_t samples = 0;
+        uint64_t selections = 0;
+        uint64_t transitions = 0;
+        uint64_t overlap_sum = 0;
+        size_t top_k = 0;
+        bool have_last = false;
+    };
+
     std::string      name;
     remote_handle64  handle;
     dspqueue_t       queue;
@@ -446,6 +463,14 @@ struct ggml_hexagon_session {
     bool                         host_copy_stop = false;
     bool                         host_copy_disabled = false;
 
+    // Optional v10.34 measurement only.  The original ffn_moe_topk tensor is
+    // copied back to the host once per layer and inference step.  Recording
+    // those IDs answers whether a small persistent expert cache could cover
+    // enough traffic to justify its memory and maintenance cost.
+    std::mutex                               route_profile_mutex;
+    std::unordered_map<int, route_layer_stats> route_profile_layers;
+    bool                                     route_profile_printed = false;
+
     uint32_t n_threads = 0;
     uint32_t n_hvx     = 0;
     uint32_t n_hmx     = 0;
@@ -473,6 +498,10 @@ struct ggml_hexagon_session {
     void enqueue_host_copy(void * dst, const void * src, size_t size);
     void wait_host_copies();
     void stop_host_copy_workers() noexcept;
+
+    void record_moe_routes(const ggml_tensor * tensor, const void * data,
+                           size_t offset, size_t size);
+    void print_moe_route_profile();
 
     void flush_pending(bool all = false);
     void flush_batch();
@@ -1293,6 +1322,181 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
 }
 
+void ggml_hexagon_session::record_moe_routes(const ggml_tensor * tensor,
+                                             const void * data,
+                                             size_t offset,
+                                             size_t size) {
+    if (!opt_route_profile || tensor->type != GGML_TYPE_I32 || offset != 0 ||
+        tensor->nb[0] != sizeof(int32_t) || tensor->ne[0] < 1 || tensor->ne[0] > 8 ||
+        tensor->ne[1] < 1) {
+        return;
+    }
+
+    int layer = -1;
+    int consumed = 0;
+    if (sscanf(tensor->name, "ffn_moe_topk-%d%n", &layer, &consumed) != 1 ||
+        consumed <= 0 || tensor->name[consumed] != '\0' || layer < 0) {
+        return;
+    }
+
+    const size_t top_k = (size_t) tensor->ne[0];
+    const size_t rows = (size_t) tensor->ne[1];
+    const size_t row_stride = tensor->nb[1];
+    const size_t row_bytes = top_k * sizeof(int32_t);
+    if (row_stride < row_bytes || rows > 1 + (SIZE_MAX - row_bytes) / row_stride) {
+        return;
+    }
+    const size_t required = (rows - 1) * row_stride + row_bytes;
+    if (size < required) {
+        GGML_LOG_WARN(
+            "DBG_V134_ROUTE_SKIP: dev=%s layer=%d size=%zu required=%zu rows=%zu stride=%zu\n",
+            this->c_name(), layer, size, required, rows, row_stride);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(this->route_profile_mutex);
+    auto & stats = this->route_profile_layers[layer];
+    stats.top_k = top_k;
+
+    const uint8_t * base = (const uint8_t *) data;
+    for (size_t row = 0; row < rows; ++row) {
+        std::array<int32_t, 8> current{};
+        current.fill(-1);
+        memcpy(current.data(), base + row * row_stride, row_bytes);
+
+        size_t valid = 0;
+        for (size_t i = 0; i < top_k; ++i) {
+            const int32_t expert = current[i];
+            if (expert >= 0 && (size_t) expert < GGML_HEXAGON_ROUTE_MAX_EXPERTS) {
+                ++stats.expert_counts[(size_t) expert];
+                ++valid;
+            }
+        }
+
+        if (stats.have_last) {
+            size_t overlap = 0;
+            for (size_t i = 0; i < top_k; ++i) {
+                if (stats.last_experts[i] < 0) {
+                    continue;
+                }
+                for (size_t j = 0; j < top_k; ++j) {
+                    if (stats.last_experts[i] == current[j]) {
+                        ++overlap;
+                        break;
+                    }
+                }
+            }
+            stats.overlap_sum += overlap;
+            ++stats.transitions;
+        }
+
+        stats.last_experts = current;
+        stats.have_last = true;
+        ++stats.samples;
+        stats.selections += valid;
+    }
+}
+
+void ggml_hexagon_session::print_moe_route_profile() {
+    if (!opt_route_profile) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(this->route_profile_mutex);
+    if (this->route_profile_printed) {
+        return;
+    }
+    this->route_profile_printed = true;
+
+    std::vector<int> layers;
+    layers.reserve(this->route_profile_layers.size());
+    for (const auto & entry : this->route_profile_layers) {
+        layers.push_back(entry.first);
+    }
+    std::sort(layers.begin(), layers.end());
+
+    uint64_t total_samples = 0;
+    uint64_t total_selections = 0;
+    uint64_t total_transitions = 0;
+    uint64_t total_overlap = 0;
+    uint64_t total_overlap_slots = 0;
+    uint64_t total_top1 = 0;
+    uint64_t total_top2 = 0;
+    uint64_t total_top4 = 0;
+    uint64_t total_top8 = 0;
+
+    for (int layer : layers) {
+        const auto & stats = this->route_profile_layers.at(layer);
+        std::vector<std::pair<uint64_t, int>> ranked;
+        ranked.reserve(GGML_HEXAGON_ROUTE_MAX_EXPERTS);
+        for (size_t expert = 0; expert < stats.expert_counts.size(); ++expert) {
+            if (stats.expert_counts[expert] != 0) {
+                ranked.push_back({stats.expert_counts[expert], (int) expert});
+            }
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto & a, const auto & b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+
+        auto top_sum = [&ranked](size_t count) {
+            uint64_t sum = 0;
+            for (size_t i = 0; i < std::min(count, ranked.size()); ++i) {
+                sum += ranked[i].first;
+            }
+            return sum;
+        };
+        const uint64_t top1 = top_sum(1);
+        const uint64_t top2 = top_sum(2);
+        const uint64_t top4 = top_sum(4);
+        const uint64_t top8 = top_sum(8);
+        const double denom = stats.selections ? (double) stats.selections : 1.0;
+        const double overlap_denom = stats.transitions && stats.top_k
+            ? (double) stats.transitions * stats.top_k : 1.0;
+
+        char top_ids[96] = {};
+        size_t pos = 0;
+        for (size_t i = 0; i < std::min<size_t>(8, ranked.size()); ++i) {
+            const int n = snprintf(top_ids + pos, sizeof(top_ids) - pos,
+                                   "%s%d", i ? "," : "", ranked[i].second);
+            if (n < 0 || (size_t) n >= sizeof(top_ids) - pos) {
+                break;
+            }
+            pos += (size_t) n;
+        }
+
+        GGML_LOG_INFO(
+            "DBG_V134_ROUTE_LAYER: dev=%s layer=%d samples=%" PRIu64
+            " selections=%" PRIu64 " top1_pct=%.3f top2_pct=%.3f top4_pct=%.3f"
+            " top8_pct=%.3f adjacent_overlap_pct=%.3f top_ids=%s\n",
+            this->c_name(), layer, stats.samples, stats.selections,
+            100.0 * top1 / denom, 100.0 * top2 / denom,
+            100.0 * top4 / denom, 100.0 * top8 / denom,
+            100.0 * stats.overlap_sum / overlap_denom, top_ids);
+
+        total_samples += stats.samples;
+        total_selections += stats.selections;
+        total_transitions += stats.transitions;
+        total_overlap += stats.overlap_sum;
+        total_overlap_slots += stats.transitions * stats.top_k;
+        total_top1 += top1;
+        total_top2 += top2;
+        total_top4 += top4;
+        total_top8 += top8;
+    }
+
+    const double selection_denom = total_selections ? (double) total_selections : 1.0;
+    const double overlap_denom = total_overlap_slots ? (double) total_overlap_slots : 1.0;
+    GGML_LOG_INFO(
+        "DBG_V134_ROUTE_SUMMARY: dev=%s layers=%zu samples=%" PRIu64
+        " selections=%" PRIu64 " transitions=%" PRIu64
+        " top1_pct=%.3f top2_pct=%.3f top4_pct=%.3f top8_pct=%.3f"
+        " adjacent_overlap_pct=%.3f\n",
+        this->c_name(), layers.size(), total_samples, total_selections,
+        total_transitions, 100.0 * total_top1 / selection_denom,
+        100.0 * total_top2 / selection_denom, 100.0 * total_top4 / selection_denom,
+        100.0 * total_top8 / selection_denom, 100.0 * total_overlap / overlap_denom);
+}
+
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                    const ggml_tensor *   tensor,
                                                    void *                data,
@@ -1349,6 +1553,8 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             memcpy(data, (const char *) tensor->data + offset, size);
             break;
     }
+
+    sess->record_moe_routes(tensor, data, offset, size);
 
     if (opt_verbose) {
         GGML_LOG_INFO(
@@ -2697,6 +2903,7 @@ void ggml_hexagon_session::release() noexcept(true) {
     // No buffer or FastRPC object may be torn down while a host worker still
     // writes sparse expert bytes into the shared allocation.
     this->stop_host_copy_workers();
+    this->print_moe_route_profile();
 
     if (this->valid_iface) {
         // Stop dspqueue/opbatch processing
@@ -5441,6 +5648,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_mmid_raw_q4_0 = getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
     const char * str_host_copy_threads = getenv("GGML_HEXAGON_HOST_COPY_THREADS");
+    const char * str_route_profile = getenv("GGML_HEXAGON_ROUTE_PROFILE");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -5476,6 +5684,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mmid_raw_q4_0 = str_mmid_raw_q4_0 ? atoi(str_mmid_raw_q4_0) : opt_mmid_raw_q4_0;
     opt_host_copy_threads = str_host_copy_threads ? strtoul(str_host_copy_threads, NULL, 0) : opt_host_copy_threads;
+    opt_route_profile = str_route_profile ? atoi(str_route_profile) : opt_route_profile;
     opt_opstage   = str_opstage  ? strtoul(str_opstage, NULL, 0)          : opt_opstage;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;

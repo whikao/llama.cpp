@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.33 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.34 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,18 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.34 is a measurement build for the next decision, not another speculative
+  cache implementation. With `GGML_HEXAGON_ROUTE_PROFILE=1`, it reads only the
+  original `ffn_moe_topk-N` host results, honors their real 512-byte row
+  stride, and reports all 48 layers as `DBG_V134_ROUTE_LAYER` records. Each
+  record contains top-1/2/4/8 expert coverage and adjacent-token expert-set
+  overlap; four device summaries are printed during clean shutdown. The
+  default is off, so normal execution and DSP math are unchanged.
+- The v10.33 phone A/B result established that four copy workers reduced total
+  time by 13.30% versus synchronous copying for the same prompt and output.
+  Eight workers gained another 6.02% in that short run, but remain an optional
+  burst mode because the logs contain no temperature sensor data. Four workers
+  remain the default for longer, cooler operation.
 - v10.33 targets the bottleneck measured by v10.32 without changing DSP math.
   The phone copied 4,069.39 MiB of selected raw Q4_0 experts in 3.405688
   seconds across 3,453 `SET` calls (about 71.4% of measured host time), while
@@ -144,7 +156,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.33.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.34.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -161,15 +173,22 @@ install -m 700 \
 "$HOME/phone-debug.sh" install
 ```
 
-Run one correctness and throughput case:
+Run the one route-profile case needed for the cache decision. Disabling the
+older verbose and tensor-slice traces keeps this measurement lightweight:
 
 ```bash
 termux-wake-lock
 PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
+ROUTE_PROFILE=1 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
   "$HOME/phone-debug.sh" run htp
 ```
 
-If the parallel result is wrong or slower, the exact synchronous control is:
+Attach the generated `share-this.tar.gz`. The route percentages determine
+whether the next build should implement a small expert cache or skip that
+memory cost and instead overlap staging with compute.
+
+For ordinary runs leave `ROUTE_PROFILE=0`. If parallel copying is wrong or
+slower, the exact synchronous control remains:
 
 ```bash
 PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=1 \

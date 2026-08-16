@@ -103,6 +103,7 @@ The main environment variables are:
 | `HTP_NGL` | Empty | Optional explicit HTP layer count |
 | `NHMX` | `1` | Enable HMX; use `0` for an HVX-only diagnostic run |
 | `HOST_COPY_THREADS` | `4` | Parallel raw-Q4_0 expert staging workers; `0` or `1` restores synchronous copies |
+| `ROUTE_PROFILE` | `0` | Set to `1` only to measure per-layer MoE expert locality |
 | `TRACE_START` | `blk.0.ffn_gate_exps` | Hexagon trace start tensor |
 | `TRACE_COUNT` | `8` | Trace checkpoint count |
 | `DEBUG_K` | `192` | Hexagon debug K value |
@@ -119,6 +120,7 @@ GGML_HEXAGON_ARCH=81
 GGML_HEXAGON_NDEV=4
 GGML_HEXAGON_NHMX=1
 GGML_HEXAGON_HOST_COPY_THREADS=4
+GGML_HEXAGON_ROUTE_PROFILE=0
 GGML_HEXAGON_MMID_RAW_Q4_0=1
 GGML_HEXAGON_HOSTBUF=1
 GGML_HEXAGON_VERBOSE=1
@@ -196,6 +198,20 @@ and teardown all fence the pool before HTP can read or release the buffer.
 `HOST_COPY_THREADS=4` enables the experiment; `0` or `1` restores the exact
 synchronous copy behavior without another build.
 
+v10.34 adds an opt-in route-locality measurement before committing memory to
+an expert cache. `ROUTE_PROFILE=1` records only exact original
+`ffn_moe_topk-N` tensors and accounts for their padded row stride. At shutdown,
+`DBG_V134_ROUTE_LAYER` reports the top-1/2/4/8 expert coverage and adjacent
+route overlap for every observed layer; `DBG_V134_ROUTE_SUMMARY` aggregates
+each HTP device. It is disabled by default and does not alter routing or DSP
+math. Use the following one-off command:
+
+```bash
+PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
+ROUTE_PROFILE=1 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
+  "$HOME/phone-debug.sh" run htp
+```
+
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 
@@ -232,6 +248,8 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
   elapsed times from the v10.32 timing build.
 - `DBG_V133_HOST_COPY_*` lines: v10.33 copy-pool configuration plus per-graph
   sparse expert jobs, bytes and wall time.
+- `DBG_V134_ROUTE_*` lines: v10.34 per-layer hot-expert coverage and
+  adjacent-token route overlap, emitted only with `ROUTE_PROFILE=1`.
 - `summary.md`: exit codes, the MMID table, build identity, phone identity, and active debug settings.
 - `share-this.tar.gz`: the small bundle to attach to the debugging chat.
 

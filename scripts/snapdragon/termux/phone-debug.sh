@@ -22,6 +22,7 @@ TIMEOUT_SECS="${TIMEOUT_SECS:-0}"
 HTP_NGL="${HTP_NGL:-}"
 NHMX="${NHMX:-1}"
 HOST_COPY_THREADS="${HOST_COPY_THREADS:-4}"
+ROUTE_PROFILE="${ROUTE_PROFILE:-0}"
 TRACE_START="${TRACE_START:-blk.0.ffn_gate_exps}"
 TRACE_COUNT="${TRACE_COUNT:-8}"
 DEBUG_K="${DEBUG_K:-192}"
@@ -56,7 +57,7 @@ Usage:
 The default command is "all". Configuration is supplied with environment
 variables. Common variables are MODEL, PROMPT, NDEV, DEVICES, CTX_SIZE,
 THREADS, TOKENS, TIMEOUT_SECS, HTP_NGL, NHMX, MMID_QUANT_MODE, LOG_ROOT,
-HOST_COPY_THREADS, and APP_ROOT.
+HOST_COPY_THREADS, ROUTE_PROFILE, and APP_ROOT.
 EOF
 }
 
@@ -95,6 +96,7 @@ validate_config() {
     require_integer TIMEOUT_SECS "$TIMEOUT_SECS"
     require_integer NHMX "$NHMX"
     require_integer HOST_COPY_THREADS "$HOST_COPY_THREADS"
+    require_integer ROUTE_PROFILE "$ROUTE_PROFILE"
     require_integer TRACE_COUNT "$TRACE_COUNT"
     require_integer DEBUG_K "$DEBUG_K"
     require_integer MMID_DEBUG "$MMID_DEBUG"
@@ -103,6 +105,7 @@ validate_config() {
     ((THREADS >= 1)) || die "THREADS must be at least 1"
     ((NHMX <= 1)) || die "NHMX must be 0 or 1"
     ((HOST_COPY_THREADS <= 8)) || die "HOST_COPY_THREADS must be between 0 and 8"
+    ((ROUTE_PROFILE <= 1)) || die "ROUTE_PROFILE must be 0 or 1"
     [[ -z "$HTP_NGL" || "$HTP_NGL" =~ ^[0-9]+$ ]] || die "HTP_NGL must be empty or a non-negative integer"
     case "$MMID_QUANT_MODE" in
         auto|block|row) ;;
@@ -317,6 +320,7 @@ write_metadata() {
         printf 'GGML_HEXAGON_NDEV=%s\n' "$GGML_HEXAGON_NDEV"
         printf 'GGML_HEXAGON_NHMX=%s\n' "$GGML_HEXAGON_NHMX"
         printf 'GGML_HEXAGON_HOST_COPY_THREADS=%s\n' "$GGML_HEXAGON_HOST_COPY_THREADS"
+        printf 'GGML_HEXAGON_ROUTE_PROFILE=%s\n' "$GGML_HEXAGON_ROUTE_PROFILE"
         printf 'GGML_HEXAGON_MMID_RAW_Q4_0=%s\n' "$GGML_HEXAGON_MMID_RAW_Q4_0"
         printf 'GGML_HEXAGON_HOSTBUF=%s\n' "$GGML_HEXAGON_HOSTBUF"
         printf 'GGML_HEXAGON_VERBOSE=%s\n' "$GGML_HEXAGON_VERBOSE"
@@ -529,6 +533,7 @@ run_suite() {
     export GGML_HEXAGON_NDEV="$NDEV"
     export GGML_HEXAGON_NHMX="$NHMX"
     export GGML_HEXAGON_HOST_COPY_THREADS="$HOST_COPY_THREADS"
+    export GGML_HEXAGON_ROUTE_PROFILE="$ROUTE_PROFILE"
     export GGML_HEXAGON_MMID_RAW_Q4_0="${GGML_HEXAGON_MMID_RAW_Q4_0:-1}"
     export GGML_HEXAGON_HOSTBUF="${GGML_HEXAGON_HOSTBUF:-1}"
     export GGML_HEXAGON_VERBOSE="${GGML_HEXAGON_VERBOSE:-1}"
