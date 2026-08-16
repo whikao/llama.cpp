@@ -363,6 +363,24 @@ struct htp_hmx_raw_profile_record {
     uint32_t output_us;
 };
 
+// v10.37: DSP -> host phase totals for the single-token raw-Q4_0 HVX
+// ffn_down_exps path.  Worker and phase values are sums across DSP workers;
+// wall_us is the longest worker duration accumulated once per profiled op.
+struct htp_hvx_raw_decode_profile_record {
+    uint32_t valid;
+    uint32_t op_count;
+    uint32_t expert_calls;
+    uint32_t tile_count;
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t worker_us;
+    uint32_t wall_us;
+    uint32_t raw_dma_us;
+    uint32_t raw_to_tiled_us;
+    uint32_t dot_us;
+    uint32_t reserved;
+};
+
 struct htp_opbatch_rsp {
     uint32_t id;         // Batch id
     uint32_t status;     // HTP_STATUS_...
@@ -440,6 +458,7 @@ struct htp_opbatch_rsp {
     uint32_t dbg_mmid_slice_count;
     struct htp_mmid_slice_trace_record dbg_mmid_slice[HTP_MMID_SLICE_TRACE_MAX];
     struct htp_hmx_raw_profile_record dbg_hmx_raw_profile;
+    struct htp_hvx_raw_decode_profile_record dbg_hvx_raw_decode_profile;
 
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };

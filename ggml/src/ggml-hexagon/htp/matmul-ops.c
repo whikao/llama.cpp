@@ -195,6 +195,15 @@ struct htp_mm_context {
     uint32_t vtcm_src2_size_per_thread;
     uint32_t vtcm_src3_size_per_thread;
     uint32_t vtcm_dst_size_per_thread;
+
+    // v10.37: per-worker qtimer totals for the one-token raw-Q4_0
+    // ffn_down_exps diagnostic.  Each worker owns one index, so no atomics are
+    // needed and worker_pool_run_func() provides the join before aggregation.
+    uint64_t dbg_v137_worker_qt[HTP_MAX_NTHREADS];
+    uint64_t dbg_v137_dma_qt[HTP_MAX_NTHREADS];
+    uint64_t dbg_v137_convert_qt[HTP_MAX_NTHREADS];
+    uint64_t dbg_v137_dot_qt[HTP_MAX_NTHREADS];
+    uint32_t dbg_v137_tiles[HTP_MAX_NTHREADS];
 };
 
 // vdelta control to expand first 32 e8m0 values into 32 uint32 elements
@@ -2221,12 +2230,6 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     htp_matmul_preamble;
 
     const struct htp_tensor * restrict ids = octx->src[2];
-    const struct htp_mm_kernel_params * kparams =
-        (const struct htp_mm_kernel_params *) octx->kernel_params;
-    const uint32_t n_prefetch = kparams->n_prefetch;
-    assert(n_prefetch >= 2 && n_prefetch <= HTP_MM_MAX_PREFETCH &&
-           (n_prefetch & (n_prefetch - 1)) == 0);
-    const uint32_t prefetch_mask = n_prefetch - 1;
     const uint32_t src0_nrows      = ne01;
     const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
@@ -2241,14 +2244,22 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     uint8_t * restrict thread_vtcm = mmctx->vtcm_src0 + mmctx->vtcm_src0_size_per_thread * ith;
     const size_t raw_row_size = nb01;
     const size_t raw_32_size = htp_mm_round_up(32 * raw_row_size, 256);
-    const size_t tiled_32_size = htp_mm_round_up(
-        (ne00 / 32) * htp_mm_get_weight_aligned_tile_size(HTP_TYPE_Q4_0), 256);
     uint8_t * restrict raw_buf = thread_vtcm;
-    uint8_t * restrict tiled_buf = thread_vtcm + n_prefetch * raw_32_size;
+    uint8_t * restrict tiled_buf = thread_vtcm + raw_32_size;
     const uint8_t * restrict src1_col = mmctx->vtcm_src1;
 
     const uint32_t n_aids = ids->ne[0];
     const uint32_t n_ids = ne02;
+
+    // Instrument only the known Qwen3-30B-A3B single-token down projection.
+    // This diagnostic build deliberately avoids perturbing gate/up and prompt.
+    const bool profile_down =
+        ne00 == 768 && ne01 == 2048 && mmctx->src1_nrows == 1;
+    uint64_t worker_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
+    uint64_t dma_qt = 0;
+    uint64_t convert_qt = 0;
+    uint64_t dot_qt = 0;
+    uint32_t tile_count = 0;
 
     for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {
         const int32_t eid = *(const int32_t *) ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
@@ -2261,50 +2272,46 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
         const uint32_t ct_start = src0_start_row / 32;
         const uint32_t ct_end   = (src0_end_row + 31) / 32;
 
-        // v10.36: fill a per-thread DMA ring first.  Once a raw slot has been
-        // converted, immediately reuse it for the next future chunk while
-        // the current tiled chunk is consumed by HVX.  Raw and tiled rings
-        // are disjoint, so the overlap cannot overwrite the active dot data.
-        uint32_t push_ct = ct_start;
-        for (uint32_t d = 0; d < n_prefetch && push_ct < ct_end; ++d, ++push_ct) {
-            const uint32_t slot = push_ct & prefetch_mask;
-            uint32_t valid_rows = ne01 - push_ct * 32;
-            valid_rows = MIN(valid_rows, 32u);
-            dma_queue_push(
-                dma_queue,
-                dma_make_ptr(raw_buf + (size_t) slot * raw_32_size,
-                             src0_expert + (size_t) push_ct * 32 * raw_row_size),
-                raw_row_size, raw_row_size, raw_row_size, valid_rows);
-        }
-
         for (uint32_t ct = ct_start; ct < ct_end; ++ct) {
             uint32_t valid_rows = ne01 - ct * 32;
             valid_rows = MIN(valid_rows, 32u);
 
-            const uint32_t slot = ct & prefetch_mask;
-            uint8_t * restrict raw_tile = raw_buf + (size_t) slot * raw_32_size;
-            uint8_t * restrict tiled_tile = tiled_buf + (size_t) slot * tiled_32_size;
+            uint64_t phase_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
+            dma_queue_push(
+                dma_queue,
+                dma_make_ptr(raw_buf,
+                             src0_expert + (size_t) ct * 32 * raw_row_size),
+                raw_row_size, raw_row_size, raw_row_size, valid_rows);
             (void) dma_queue_pop(dma_queue);
+            if (profile_down) {
+                dma_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+            }
 
+            phase_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
             htp_raw_q4_0_32rows_to_tiled(
-                raw_tile, raw_row_size, tiled_tile, ne00, valid_rows);
-
-            if (push_ct < ct_end) {
-                uint32_t next_valid_rows = ne01 - push_ct * 32;
-                next_valid_rows = MIN(next_valid_rows, 32u);
-                dma_queue_push(
-                    dma_queue,
-                    dma_make_ptr(raw_tile,
-                                 src0_expert + (size_t) push_ct * 32 * raw_row_size),
-                    raw_row_size, raw_row_size, raw_row_size, next_valid_rows);
-                ++push_ct;
+                raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+            if (profile_down) {
+                convert_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
             }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+            phase_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
             tiled_vec_dot_q4_0_32x1(
-                ne10, &dst_row[ct * 32], tiled_tile, src1_col, valid_rows, NULL);
+                ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+            if (profile_down) {
+                dot_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+                ++tile_count;
+            }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
         }
+    }
+
+    if (profile_down) {
+        mmctx->dbg_v137_worker_qt[ith] = HAP_perf_get_qtimer_count() - worker_start_qt;
+        mmctx->dbg_v137_dma_qt[ith] = dma_qt;
+        mmctx->dbg_v137_convert_qt[ith] = convert_qt;
+        mmctx->dbg_v137_dot_qt[ith] = dot_qt;
+        mmctx->dbg_v137_tiles[ith] = tile_count;
     }
 
     (void) nth;
@@ -4822,6 +4829,45 @@ static int hvx_mm_matmul_id(
     htp_trace_event_stop(tr, HTP_TRACE_EVT_INIT, 0);
 
     worker_pool_run_func(octx->ctx->worker_pool, hvx_mmid_task_func, mmctx, octx->n_threads);
+
+    if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0 &&
+        src1_nrows == 1 && ne00 == 768 && ne01 == 2048) {
+        uint64_t worker_qt = 0;
+        uint64_t wall_qt = 0;
+        uint64_t dma_qt = 0;
+        uint64_t convert_qt = 0;
+        uint64_t dot_qt = 0;
+        uint32_t tiles = 0;
+        for (uint32_t ith = 0; ith < octx->n_threads; ++ith) {
+            worker_qt += mmctx->dbg_v137_worker_qt[ith];
+            wall_qt = MAX(wall_qt, mmctx->dbg_v137_worker_qt[ith]);
+            dma_qt += mmctx->dbg_v137_dma_qt[ith];
+            convert_qt += mmctx->dbg_v137_convert_qt[ith];
+            dot_qt += mmctx->dbg_v137_dot_qt[ith];
+            tiles += mmctx->dbg_v137_tiles[ith];
+        }
+
+        uint32_t expert_calls = 0;
+        for (uint32_t ie1 = 0; ie1 < ids->ne[0]; ++ie1) {
+            const int32_t eid = *(const int32_t *)
+                ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
+            expert_calls += eid >= 0;
+        }
+
+        struct htp_hvx_raw_decode_profile_record * out =
+            &octx->dbg_hvx_raw_decode_profile;
+        out->valid = 1;
+        out->op_count = 1;
+        out->expert_calls = expert_calls;
+        out->tile_count = tiles;
+        out->ne00 = ne00;
+        out->ne01 = ne01;
+        out->worker_us = (uint32_t) HAP_perf_qtimer_count_to_us(worker_qt);
+        out->wall_us = (uint32_t) HAP_perf_qtimer_count_to_us(wall_qt);
+        out->raw_dma_us = (uint32_t) HAP_perf_qtimer_count_to_us(dma_qt);
+        out->raw_to_tiled_us = (uint32_t) HAP_perf_qtimer_count_to_us(convert_qt);
+        out->dot_us = (uint32_t) HAP_perf_qtimer_count_to_us(dot_qt);
+    }
 
     return HTP_STATUS_OK;
 }

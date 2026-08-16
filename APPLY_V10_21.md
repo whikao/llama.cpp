@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.36 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.37 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,19 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.37 rejects and removes the v10.36 per-worker DMA ring.  The deterministic
+  32-token phone run remained numerically correct, but generation fell from the
+  v10.35.1 control's 1.74 t/s to 1.66 t/s (18.391 s to 19.269 s, 4.78% slower)
+  and total time increased from 23.384 s to 23.694 s.  The raw-Q4_0 decode
+  layout and worker are therefore restored to the v10.35 single raw/tiled
+  working slot.
+- This is one focused diagnostic build, not another speculative optimization.
+  It instruments only single-token raw-Q4_0 `ffn_down_exps` with the observed
+  Qwen3 shape K=768, N=2048.  `DBG_V137_HVX_RAW_DOWN_PROFILE` reports summed
+  worker, DMA, raw-to-tiled conversion and HVX dot times plus per-op wall time,
+  tile count and residual time.  Gate/up, prompt HMX math and tensor values are
+  unchanged.  The timer calls add diagnostic overhead, so use this version to
+  choose the next code change rather than as a final speed benchmark.
 - v10.36 uses the v10.35.2 operator profile to target single-token decode.
   The model is mixed by layer: `ffn_down_exps` is Q4_1 only in layers 0--5,
   while layers 6--47 use raw Q4_0. Those raw-Q4_0 down calls consumed about
@@ -203,7 +216,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.36.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.37.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -217,22 +230,25 @@ Android Hexagon workflow. After it succeeds, install the new rolling release:
 "$HOME/phone-debug.sh" status
 ```
 
-Run one deterministic 32-token comparison with profiling disabled. The
-rejected exact-address cache stays off and four host-copy workers remain the
-normal setting:
+Run one deterministic 8-token diagnostic.  The new phase counter is built in,
+so keep the much broader backend profiler disabled.  The rejected
+exact-address cache stays off and four host-copy workers remain the normal
+setting:
 
 ```bash
 termux-wake-lock
-PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
+PROMPT='请用一句话介绍你自己。' TOKENS=8 HOST_COPY_THREADS=4 \
 EXPERT_COPY_CACHE=0 ROUTE_PROFILE=0 PROFILE_MODE=0 \
 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
   "$HOME/phone-debug.sh" run htp --seed 1234 --temp 0
 ```
 
-Attach the generated `share-this.tar.gz`. Compare its ordinary wall time and
-generated text with the v10.35.1 control: prompt 4.870 s, generation 32 tokens
-in 18.391 s (1.74 t/s), total 23.384 s. Eight host-copy workers remain an
-optional later burst test; do not mix that variable into this first comparison.
+Attach the generated `share-this.tar.gz`.  The
+`DBG_V137_HVX_RAW_DOWN_PROFILE` totals decide whether the next source change
+targets DDR DMA, raw-to-tiled conversion or the Q4_0/Q8_0 dot.  This run is not
+used as the ordinary 32-token speed score because its per-tile timers are
+intentional overhead.  Eight host-copy workers remain an optional later burst
+test; do not mix that variable into this diagnostic.
 
 For ordinary runs leave `ROUTE_PROFILE=0` and `EXPERT_COPY_CACHE=0`. If the
 cache test is wrong or slower, leave it at zero. If parallel copying is wrong

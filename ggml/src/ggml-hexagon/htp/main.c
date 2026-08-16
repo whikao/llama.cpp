@@ -1278,6 +1278,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     memset(dbg_mmid_slice, 0, sizeof(dbg_mmid_slice));
     struct htp_hmx_raw_profile_record dbg_hmx_raw_profile;
     memset(&dbg_hmx_raw_profile, 0, sizeof(dbg_hmx_raw_profile));
+    struct htp_hvx_raw_decode_profile_record dbg_hvx_raw_decode_profile;
+    memset(&dbg_hvx_raw_decode_profile, 0, sizeof(dbg_hvx_raw_decode_profile));
 
     for (uint32_t i = 0; i < n_ops && op_status == HTP_STATUS_OK; i++) {
         struct profile_data prof;
@@ -1303,6 +1305,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
         }
 
         memset(&octx->dbg_hmx_raw_profile, 0, sizeof(octx->dbg_hmx_raw_profile));
+        memset(&octx->dbg_hvx_raw_decode_profile, 0,
+               sizeof(octx->dbg_hvx_raw_decode_profile));
         op_status = proc_op_req(octx, tens, i, &ops[i]);
 
         // v10.25.2: aggregate all raw-HMX MMID phase totals in this batch and
@@ -1320,6 +1324,24 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             dbg_hmx_raw_profile.dequant_us      += src->dequant_us;
             dbg_hmx_raw_profile.hmx_us          += src->hmx_us;
             dbg_hmx_raw_profile.output_us       += src->output_us;
+        }
+
+        // v10.37: aggregate only the instrumented one-token raw-Q4_0
+        // ffn_down_exps operations in this batch.
+        if (octx->dbg_hvx_raw_decode_profile.valid) {
+            const struct htp_hvx_raw_decode_profile_record * src =
+                &octx->dbg_hvx_raw_decode_profile;
+            dbg_hvx_raw_decode_profile.valid = 1;
+            dbg_hvx_raw_decode_profile.op_count += src->op_count;
+            dbg_hvx_raw_decode_profile.expert_calls += src->expert_calls;
+            dbg_hvx_raw_decode_profile.tile_count += src->tile_count;
+            dbg_hvx_raw_decode_profile.ne00 = src->ne00;
+            dbg_hvx_raw_decode_profile.ne01 = src->ne01;
+            dbg_hvx_raw_decode_profile.worker_us += src->worker_us;
+            dbg_hvx_raw_decode_profile.wall_us += src->wall_us;
+            dbg_hvx_raw_decode_profile.raw_dma_us += src->raw_dma_us;
+            dbg_hvx_raw_decode_profile.raw_to_tiled_us += src->raw_to_tiled_us;
+            dbg_hvx_raw_decode_profile.dot_us += src->dot_us;
         }
 
         // Never leave a stack-backed trace pointer armed for a later op.
@@ -1479,6 +1501,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.dbg_mmid_slice_count = dbg_mmid_slice_count;
     memcpy(rsp.dbg_mmid_slice, dbg_mmid_slice, sizeof(dbg_mmid_slice));
     rsp.dbg_hmx_raw_profile = dbg_hmx_raw_profile;
+    rsp.dbg_hvx_raw_decode_profile = dbg_hvx_raw_decode_profile;
     rsp.dbg_full_ref_bits = dbg_full_ref_bits;
     memcpy(rsp.dbg_q8_actual, dbg_q8_actual, sizeof(dbg_q8_actual));
     memcpy(rsp.dbg_q8_scalar, dbg_q8_scalar, sizeof(dbg_q8_scalar));

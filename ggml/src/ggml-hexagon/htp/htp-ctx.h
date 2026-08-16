@@ -77,6 +77,9 @@ struct htp_ops_context {
     // v10.25.2: one-op raw-HMX phase totals, consumed by process_opbatch()
     // immediately after proc_op_req() returns.
     struct htp_hmx_raw_profile_record    dbg_hmx_raw_profile;
+
+    // v10.37: one-op single-token raw-HVX ffn_down phase totals.
+    struct htp_hvx_raw_decode_profile_record dbg_hvx_raw_decode_profile;
 };
 
 // Main context for htp DSP backend

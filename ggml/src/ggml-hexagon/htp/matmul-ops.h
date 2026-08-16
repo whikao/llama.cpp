@@ -531,15 +531,13 @@ static inline void htp_mm_hvx_vtcm_layout_build(
         src1_sz                   = htp_mm_round_up(src1_row_size_tiled * src1_nrows, 256);
 
         if (kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0) {
-            // v10.36: keep a ring of raw and converted 32-row chunks per
-            // worker.  The raw decode worker uses the already-selected
-            // n_prefetch value to overlap DDR DMA with conversion and dot
-            // work instead of waiting after every small chunk.
+            // v10.37: restore the v10.35 single-slot layout.  The v10.36
+            // n_prefetch ring was correct but regressed 32-token generation.
             const uint32_t n_k_tiles = ne10 / 32;
             const size_t raw_32_rows = htp_mm_round_up(32 * src0_row_size, 256);
             const size_t tiled_32_rows = htp_mm_round_up(
                 n_k_tiles * htp_mm_get_weight_aligned_tile_size(HTP_TYPE_Q4_0), 256);
-            src0_sz_per_thread = n_prefetch * (raw_32_rows + tiled_32_rows);
+            src0_sz_per_thread = raw_32_rows + tiled_32_rows;
         } else if (is_repack) {
             const uint32_t aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
             const uint32_t n_k_tiles         = ne10 / 32;

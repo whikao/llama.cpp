@@ -254,11 +254,15 @@ That profile also corrected the next target. `ffn_down_exps` is Q4_1 only in
 layers 0--5; layers 6--47 are raw Q4_0 and accounted for about 1.393 seconds of
 the measured down path. The common one-token raw-Q4_0 down call averaged
 3.04 ms, versus about 0.85 and 0.83 ms for gate and up. Since one-token decode
-is below the HMX row threshold, v10.36 optimizes `hvx_mv_id_raw_q4_0`: the raw
-VTCM layout now uses the existing `n_prefetch` selection as a ring of raw and
-converted 32-row slots. DDR DMA for future slots overlaps conversion and dot
-work for the current slot. It adds no threads, changes no tensor bytes, and is
-not the model-sized HTP_REPACK route.
+is below the HMX row threshold, v10.36 tried a per-worker raw/tiled prefetch
+ring in `hvx_mv_id_raw_q4_0`.  Its deterministic output stayed correct, but
+32-token generation regressed from 1.74 t/s to 1.66 t/s, so v10.37 removes the
+ring and restores the v10.35 single-slot worker.  v10.37 is a diagnostic build:
+only the raw-Q4_0 single-token down shape K=768, N=2048 gets phase timers.
+`DBG_V137_HVX_RAW_DOWN_PROFILE` separates DMA, raw-to-tiled conversion and dot
+work.  Run 8 tokens with `PROFILE_MODE=0`, then attach `share-this.tar.gz`;
+timer overhead means this run selects the next target rather than serving as a
+final speed benchmark.
 
 Run exactly one initial v10.35 validation:
 
@@ -306,6 +310,8 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
 - `DBG_V125_HMX_RAW_PROFILE` lines: accumulated raw-HMX phase timings for each
   `MUL_MAT_ID`, including raw DMA, layout conversion, dequantization and HMX
   compute.
+- `DBG_V137_HVX_RAW_DOWN_PROFILE` lines: v10.37 single-token raw-Q4_0
+  `ffn_down_exps` worker, wall, DMA, conversion, dot and residual timings.
 - `DBG_V132_HOST_*` lines: host tensor-copy, graph-execution and synchronization
   elapsed times from the v10.32 timing build.
 - `DBG_V133_HOST_COPY_*` lines: v10.33 copy-pool configuration plus per-graph

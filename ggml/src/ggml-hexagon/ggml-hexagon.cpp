@@ -2367,6 +2367,24 @@ struct ggml_hexagon_opqueue {
                 p.raw_to_tiled_us, p.dequant_us, p.hmx_us, p.output_us);
         }
 
+        // v10.37 single-token raw-Q4_0 ffn_down_exps phase totals.
+        if (rsp.dbg_hvx_raw_decode_profile.valid) {
+            const auto & p = rsp.dbg_hvx_raw_decode_profile;
+            const uint32_t measured_us =
+                p.raw_dma_us + p.raw_to_tiled_us + p.dot_us;
+            const uint32_t residual_us =
+                p.worker_us > measured_us ? p.worker_us - measured_us : 0;
+            GGML_LOG_INFO(
+                "DBG_V137_HVX_RAW_DOWN_PROFILE: dev=%s batch=%u ops=%u "
+                "experts=%u tiles=%u ne00=%u ne01=%u worker_us=%u "
+                "wall_us=%u raw_dma_us=%u raw_to_tiled_us=%u dot_us=%u "
+                "residual_us=%u\n",
+                shm_buf->sess->c_name(), rsp.id, p.op_count,
+                p.expert_calls, p.tile_count, p.ne00, p.ne01,
+                p.worker_us, p.wall_us, p.raw_dma_us,
+                p.raw_to_tiled_us, p.dot_us, residual_us);
+        }
+
         // v10.19 generic post-op trace.
         if (rsp.dbg_trace_count > 0) {
             const auto & cached_ops = op_cache[rsp.id];
