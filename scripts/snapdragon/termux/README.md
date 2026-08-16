@@ -177,6 +177,14 @@ scale loop: one word gather fetches all 32 fp16 scales, one halfword deal
 compacts them in row order, and one 64-byte predicated vector store writes the
 scale area. The partial-row path remains unchanged.
 
+The cooled v10.31 repeat generated the correct `你好` token in 5.827 seconds.
+Raw-to-tiled conversion was stable at 0.416591 seconds across 135 records and
+4,797 experts, while total profiled MMID time was 0.629966 seconds. Because
+most prompt time is now outside that DSP profile, v10.32 keeps the v10.31
+kernel unchanged and adds `DBG_V132_HOST_SET`, `HOST_GET`, `HOST_GRAPH` and
+`HOST_SYNC` elapsed-time records. They identify whether the next target is
+sparse expert transfer, graph execution or synchronization.
+
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 
@@ -209,6 +217,8 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
 - `DBG_V125_HMX_RAW_PROFILE` lines: accumulated raw-HMX phase timings for each
   `MUL_MAT_ID`, including raw DMA, layout conversion, dequantization and HMX
   compute.
+- `DBG_V132_HOST_*` lines: host tensor-copy, graph-execution and synchronization
+  elapsed times from the v10.32 timing build.
 - `summary.md`: exit codes, the MMID table, build identity, phone identity, and active debug settings.
 - `share-this.tar.gz`: the small bundle to attach to the debugging chat.
 

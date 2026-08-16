@@ -1104,6 +1104,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                size) {
     auto sbuf = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess = sbuf->sess;
+    const int64_t host_start_us = opt_verbose ? ggml_time_us() : 0;
 
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
@@ -1253,6 +1254,13 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             memcpy((char *) tensor->data + offset, data, size);
             break;
     }
+
+    if (opt_verbose) {
+        GGML_LOG_INFO(
+            "DBG_V132_HOST_SET: dev=%s tensor=%s type=%s offset=%zu size=%zu elapsed_us=%" PRId64 "\n",
+            sess->c_name(), tensor->name, ggml_type_name(tensor->type), offset, size,
+            ggml_time_us() - host_start_us);
+    }
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -1262,6 +1270,7 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                    size_t                size) {
     auto sbuf = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess = sbuf->sess;
+    const int64_t host_start_us = opt_verbose ? ggml_time_us() : 0;
 
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
@@ -1309,6 +1318,13 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         default:
             memcpy(data, (const char *) tensor->data + offset, size);
             break;
+    }
+
+    if (opt_verbose) {
+        GGML_LOG_INFO(
+            "DBG_V132_HOST_GET: dev=%s tensor=%s type=%s offset=%zu size=%zu elapsed_us=%" PRId64 "\n",
+            sess->c_name(), tensor->name, ggml_type_name(tensor->type), offset, size,
+            ggml_time_us() - host_start_us);
     }
 }
 
@@ -4406,6 +4422,7 @@ static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph *
 
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    const int64_t host_start_us = opt_verbose ? ggml_time_us() : 0;
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
@@ -4474,16 +4491,29 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     // Wait until all pending ops complete
     sess->flush();
 
+    if (opt_verbose) {
+        GGML_LOG_INFO(
+            "DBG_V132_HOST_GRAPH: dev=%s nodes=%d cache_hit=%d elapsed_us=%" PRId64 "\n",
+            sess->c_name(), graph->n_nodes, cache_hit ? 1 : 0,
+            ggml_time_us() - host_start_us);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    const int64_t host_start_us = opt_verbose ? ggml_time_us() : 0;
 
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
     // Wait until all pending ops complete
     sess->flush();
+
+    if (opt_verbose) {
+        GGML_LOG_INFO("DBG_V132_HOST_SYNC: dev=%s elapsed_us=%" PRId64 "\n",
+            sess->c_name(), ggml_time_us() - host_start_us);
+    }
 }
 
 static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<htp_opnode> & nodes) {

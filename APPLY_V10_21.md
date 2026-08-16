@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.31 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.32 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,19 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.32 is a host-side timing build. It leaves the verified v10.31 DSP math
+  and memory layout unchanged, and records elapsed microseconds for backend
+  tensor uploads/downloads, graph execution and explicit synchronization as
+  `DBG_V132_HOST_*` lines. These records isolate the roughly 5.2 prompt seconds
+  now outside the profiled MMID kernel before the next performance change.
+- The cooled v10.31 repeat confirmed the optimization: it generated `你好`, all
+  28 slices remained finite, and the full reference difference stayed
+  `-5.36e-09`. Prompt evaluation was 5.827 seconds. Across the same 135 records
+  and 4,797 experts, raw-to-tiled was 0.416591 of 0.629966 profiled MMID
+  seconds. Compared with v10.30, conversion is 8.02x faster and prompt
+  evaluation is 1.45x faster. The earlier 8.822-second v10.31 run had almost
+  identical 0.416621-second conversion time, confirming that its extra delay
+  was outside this DSP phase.
 - v10.31 replaces the last full-tile strided scalar loop: the 32 fp16 Q4_0
   scales are gathered as low halfwords of 32 words, compacted in row order by
   one halfword `vdeal`, and written with one 64-byte predicated vector store.
@@ -114,7 +127,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.31.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.32.tar.gz -C .
 git diff --check
 git status --short
 ```
