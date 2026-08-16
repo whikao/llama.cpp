@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.30 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.31 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,16 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.31 replaces the last full-tile strided scalar loop: the 32 fp16 Q4_0
+  scales are gathered as low halfwords of 32 words, compacted in row order by
+  one halfword `vdeal`, and written with one 64-byte predicated vector store.
+  The partial-row fallback remains unchanged.
+- v10.30 is the fastest correct phone result so far. It generated `你好`, all
+  28 slices stayed finite, and its first full reference difference remained
+  `-5.36e-09`. Prompt evaluation fell from v10.28's 14.036 seconds to 8.417
+  seconds (1.67x faster), while raw-to-tiled fell from 8.323 to 3.342 seconds
+  (59.8%). Conversion still represented 93.72% of profiled MMID time, so the
+  remaining scalar scale copies are the v10.31 target.
 - v10.30 removes the gather post-processing scalar row loop. The verified
   v10.28 gathered words remain in HVX registers; word shifts plus masks form
   the same four Q4_0 packed-byte equations, and two byte `vdeal` operations
@@ -104,7 +114,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.30.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.31.tar.gz -C .
 git diff --check
 git status --short
 ```

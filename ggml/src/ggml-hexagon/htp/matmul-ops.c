@@ -1337,12 +1337,21 @@ static void htp_raw_q4_0_32rows_to_tiled(
                 hvx_vec_store_u(tile + (qp + 9) * 32, 32, htp_raw_q4_0_compact_word_lsb(packed));
             }
 
+            // v10.31: gather each row's fp16 scale as the low halfword of one
+            // word. One halfword deal compacts those 32 scales into the first
+            // 64 bytes in row order, replacing 32 strided scalar copies.
+            const uint32_t scale_offset = kt * HTP_RAW_Q4_0_BLOCK_BYTES;
+            const HVX_Vector v_scale_offsets = Q6_Vw_vadd_VwVw(
+                v_raw_row_offsets, Q6_V_vsplat_R((int) scale_offset));
+            Q6_vgather_ARMVw(
+                (HVX_Vector *) gather_words,
+                (size_t) raw,
+                gather_region,
+                v_scale_offsets);
+            const HVX_Vector v_scale_words = hvx_vmem(gather_words);
+            const HVX_Vector v_scales = Q6_Vh_vdeal_Vh(v_scale_words);
             uint8_t * scale_dst = tile + 512;
-            for (uint32_t row = 0; row < 32; ++row) {
-                const uint8_t * block =
-                    raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
-                memcpy(scale_dst + 2 * row, block, 2);
-            }
+            hvx_vec_store_u(scale_dst, 64, v_scales);
             memset(tile + HTP_MM_WEIGHT_TILE_SIZE_Q4_0, 0,
                    HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 - HTP_MM_WEIGHT_TILE_SIZE_Q4_0);
             continue;

@@ -170,6 +170,13 @@ Q4_0 byte, two byte-deal operations compact byte 0 of every 32-bit row word,
 and a predicated vector store writes the 32 rows. It adds no buffer and retains
 the existing scalar fallback for partial-row tiles.
 
+The v10.30 phone run remained correct and reduced prompt evaluation to 8.417
+seconds. Raw-to-tiled conversion fell to 3.342 of 3.566 profiled MMID seconds,
+but still represented 93.72%. v10.31 removes the remaining full-tile scalar
+scale loop: one word gather fetches all 32 fp16 scales, one halfword deal
+compacts them in row order, and one 64-byte predicated vector store writes the
+scale area. The partial-row path remains unchanged.
+
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 
