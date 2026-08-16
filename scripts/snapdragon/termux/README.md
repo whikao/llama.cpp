@@ -102,6 +102,7 @@ The main environment variables are:
 | `TIMEOUT_SECS` | `0` | Per-run timeout; disabled by default to match direct Termux execution |
 | `HTP_NGL` | Empty | Optional explicit HTP layer count |
 | `NHMX` | `1` | Enable HMX; use `0` for an HVX-only diagnostic run |
+| `HOST_COPY_THREADS` | `4` | Parallel raw-Q4_0 expert staging workers; `0` or `1` restores synchronous copies |
 | `TRACE_START` | `blk.0.ffn_gate_exps` | Hexagon trace start tensor |
 | `TRACE_COUNT` | `8` | Trace checkpoint count |
 | `DEBUG_K` | `192` | Hexagon debug K value |
@@ -117,6 +118,7 @@ The script sets the current debug environment automatically:
 GGML_HEXAGON_ARCH=81
 GGML_HEXAGON_NDEV=4
 GGML_HEXAGON_NHMX=1
+GGML_HEXAGON_HOST_COPY_THREADS=4
 GGML_HEXAGON_MMID_RAW_Q4_0=1
 GGML_HEXAGON_HOSTBUF=1
 GGML_HEXAGON_VERBOSE=1
@@ -185,6 +187,15 @@ kernel unchanged and adds `DBG_V132_HOST_SET`, `HOST_GET`, `HOST_GRAPH` and
 `HOST_SYNC` elapsed-time records. They identify whether the next target is
 sparse expert transfer, graph execution or synchronization.
 
+The v10.32 phone timing identified sparse expert staging as the next target:
+3,453 raw-Q4_0 `SET` calls copied 4,069.39 MiB in 3.405688 seconds, while all
+explicit synchronization used only 0.071097 seconds. v10.33 keeps the model
+and DSP kernels unchanged, but lets a persistent host pool copy independent
+`_exps.weight` ranges in parallel. Graph submission, explicit synchronization
+and teardown all fence the pool before HTP can read or release the buffer.
+`HOST_COPY_THREADS=4` enables the experiment; `0` or `1` restores the exact
+synchronous copy behavior without another build.
+
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 
@@ -219,6 +230,8 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
   compute.
 - `DBG_V132_HOST_*` lines: host tensor-copy, graph-execution and synchronization
   elapsed times from the v10.32 timing build.
+- `DBG_V133_HOST_COPY_*` lines: v10.33 copy-pool configuration plus per-graph
+  sparse expert jobs, bytes and wall time.
 - `summary.md`: exit codes, the MMID table, build identity, phone identity, and active debug settings.
 - `share-this.tar.gz`: the small bundle to attach to the debugging chat.
 

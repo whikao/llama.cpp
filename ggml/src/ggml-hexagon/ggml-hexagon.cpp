@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <cstddef>
@@ -74,6 +75,7 @@ static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static int    opt_hostbuf = 1; // hostbuf ON by default
 static int    opt_mmid_raw_q4_0 = 0; // EXPERIMENTAL: keep Q4_0 MUL_MAT_ID weights on host; scheduler stages raw copies
+static size_t opt_host_copy_threads = 4; // v10.33: parallel host copies for sparse raw-Q4_0 expert staging
 
 // v10.12 runtime MMID debug driver. Change these environment variables between
 // runs; no rebuild is required.
@@ -402,6 +404,12 @@ struct ggml_hexagon_opqueue;
 struct htp_opnode;
 
 struct ggml_hexagon_session {
+    struct host_copy_job {
+        void *       dst;
+        const void * src;
+        size_t       size;
+    };
+
     std::string      name;
     remote_handle64  handle;
     dspqueue_t       queue;
@@ -420,6 +428,23 @@ struct ggml_hexagon_session {
 
     ggml_backend_buffer_type buffer_type        = {};
     ggml_backend_buffer_type repack_buffer_type = {};
+
+    // The scheduler stages only the selected MoE experts into the HTP host
+    // buffer.  v10.32 measured those memcpy calls as the dominant host cost.
+    // Keep the source model untouched and parallelize only that staging copy;
+    // graph_compute/synchronize provide the completion fence.
+    std::mutex                   host_copy_mutex;
+    std::condition_variable      host_copy_ready;
+    std::condition_variable      host_copy_done;
+    std::queue<host_copy_job>    host_copy_jobs;
+    std::vector<std::thread>     host_copy_workers;
+    size_t                       host_copy_pending = 0;
+    size_t                       host_copy_batch_jobs = 0;
+    size_t                       host_copy_batch_bytes = 0;
+    int64_t                      host_copy_batch_start_us = 0;
+    bool                         host_copy_started = false;
+    bool                         host_copy_stop = false;
+    bool                         host_copy_disabled = false;
 
     uint32_t n_threads = 0;
     uint32_t n_hvx     = 0;
@@ -443,6 +468,11 @@ struct ggml_hexagon_session {
 
     void enqueue_op(const htp_opnode & node);
     void flush(bool all = true);
+
+    bool start_host_copy_workers() noexcept;
+    void enqueue_host_copy(void * dst, const void * src, size_t size);
+    void wait_host_copies();
+    void stop_host_copy_workers() noexcept;
 
     void flush_pending(bool all = false);
     void flush_batch();
@@ -2305,6 +2335,140 @@ void ggml_hexagon_session::flush(bool all) {
     flush_pending(all);
 }
 
+bool ggml_hexagon_session::start_host_copy_workers() noexcept {
+    if (opt_host_copy_threads <= 1) {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(this->host_copy_mutex);
+    if (this->host_copy_started) {
+        return true;
+    }
+    if (this->host_copy_disabled) {
+        return false;
+    }
+
+    this->host_copy_started = true;
+    this->host_copy_stop = false;
+    try {
+        this->host_copy_workers.reserve(opt_host_copy_threads);
+        for (size_t i = 0; i < opt_host_copy_threads; ++i) {
+            this->host_copy_workers.emplace_back([this]() {
+                for (;;) {
+                    host_copy_job job{};
+                    {
+                        std::unique_lock<std::mutex> worker_lock(this->host_copy_mutex);
+                        this->host_copy_ready.wait(worker_lock, [this]() {
+                            return this->host_copy_stop || !this->host_copy_jobs.empty();
+                        });
+                        if (this->host_copy_stop && this->host_copy_jobs.empty()) {
+                            return;
+                        }
+                        job = this->host_copy_jobs.front();
+                        this->host_copy_jobs.pop();
+                    }
+
+                    memcpy(job.dst, job.src, job.size);
+
+                    {
+                        std::lock_guard<std::mutex> worker_lock(this->host_copy_mutex);
+                        GGML_ASSERT(this->host_copy_pending > 0);
+                        --this->host_copy_pending;
+                        if (this->host_copy_pending == 0) {
+                            this->host_copy_done.notify_all();
+                        }
+                    }
+                }
+            });
+        }
+    } catch (...) {
+        // A phone may refuse another thread under memory pressure.  Preserve
+        // correctness by disabling the experiment and falling back to the
+        // original synchronous memcpy path.
+        this->host_copy_stop = true;
+        lock.unlock();
+        this->host_copy_ready.notify_all();
+        for (auto & worker : this->host_copy_workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        lock.lock();
+        this->host_copy_workers.clear();
+        this->host_copy_started = false;
+        this->host_copy_stop = false;
+        this->host_copy_disabled = true;
+        GGML_LOG_WARN("DBG_V133_HOST_COPY_FALLBACK: dev=%s unable to start %zu copy workers\n",
+                      this->c_name(), opt_host_copy_threads);
+        return false;
+    }
+
+    GGML_LOG_INFO("DBG_V133_HOST_COPY_CONFIG: dev=%s threads=%zu\n",
+                  this->c_name(), opt_host_copy_threads);
+    return true;
+}
+
+void ggml_hexagon_session::enqueue_host_copy(void * dst, const void * src, size_t size) {
+    if (!this->start_host_copy_workers()) {
+        memcpy(dst, src, size);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(this->host_copy_mutex);
+        if (this->host_copy_batch_jobs == 0) {
+            this->host_copy_batch_start_us = ggml_time_us();
+        }
+        this->host_copy_jobs.push({ dst, src, size });
+        ++this->host_copy_pending;
+        ++this->host_copy_batch_jobs;
+        this->host_copy_batch_bytes += size;
+    }
+    this->host_copy_ready.notify_one();
+}
+
+void ggml_hexagon_session::wait_host_copies() {
+    size_t batch_jobs = 0;
+    size_t batch_bytes = 0;
+    int64_t batch_start_us = 0;
+
+    {
+        std::unique_lock<std::mutex> lock(this->host_copy_mutex);
+        this->host_copy_done.wait(lock, [this]() {
+            return this->host_copy_pending == 0;
+        });
+        batch_jobs = this->host_copy_batch_jobs;
+        batch_bytes = this->host_copy_batch_bytes;
+        batch_start_us = this->host_copy_batch_start_us;
+        this->host_copy_batch_jobs = 0;
+        this->host_copy_batch_bytes = 0;
+        this->host_copy_batch_start_us = 0;
+    }
+
+    if (opt_verbose && batch_jobs > 0) {
+        GGML_LOG_INFO(
+            "DBG_V133_HOST_COPY_BATCH: dev=%s threads=%zu jobs=%zu bytes=%zu elapsed_us=%" PRId64 "\n",
+            this->c_name(), opt_host_copy_threads, batch_jobs, batch_bytes,
+            ggml_time_us() - batch_start_us);
+    }
+}
+
+void ggml_hexagon_session::stop_host_copy_workers() noexcept {
+    this->wait_host_copies();
+    {
+        std::lock_guard<std::mutex> lock(this->host_copy_mutex);
+        this->host_copy_stop = true;
+    }
+    this->host_copy_ready.notify_all();
+    for (auto & worker : this->host_copy_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    this->host_copy_workers.clear();
+    this->host_copy_started = false;
+}
+
 static size_t ggml_hexagon_measure_max_vmem(ggml_hexagon_session *sess) {
     // Allocate a bunch pinned buffers till failure.
     // This is kind of expensive but handy for figuring out exactly how much we can mmap on a specific device.
@@ -2529,6 +2693,10 @@ void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
     int err;
+
+    // No buffer or FastRPC object may be torn down while a host worker still
+    // writes sparse expert bytes into the shared allocation.
+    this->stop_host_copy_workers();
 
     if (this->valid_iface) {
         // Stop dspqueue/opbatch processing
@@ -4426,6 +4594,11 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
+    // set_tensor_async() may have queued sparse expert copies.  The scheduler
+    // calls graph_compute only after issuing all inputs for this split, so this
+    // is the single completion fence before the DSP can consume them.
+    sess->wait_host_copies();
+
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
     std::vector<htp_opnode> computed_nodes;
 
@@ -4507,6 +4680,8 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
 
     HEX_VERBOSE("ggml-hex: %s synchronize\n", sess->c_name());
 
+    sess->wait_host_copies();
+
     // Wait until all pending ops complete
     sess->flush();
 
@@ -4514,6 +4689,40 @@ static void ggml_backend_hexagon_synchronize(ggml_backend_t backend) {
         GGML_LOG_INFO("DBG_V132_HOST_SYNC: dev=%s elapsed_us=%" PRId64 "\n",
             sess->c_name(), ggml_time_us() - host_start_us);
     }
+}
+
+static void ggml_backend_hexagon_set_tensor_async(
+        ggml_backend_t backend,
+        ggml_tensor * tensor,
+        const void * data,
+        size_t offset,
+        size_t size) {
+    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    if (buffer == nullptr && tensor->view_src != nullptr) {
+        buffer = tensor->view_src->buffer;
+    }
+
+    const bool raw_q4_0_expert_copy =
+        opt_mmid_raw_q4_0 &&
+        opt_host_copy_threads > 1 &&
+        tensor->type == GGML_TYPE_Q4_0 &&
+        buffer != nullptr &&
+        !ggml_backend_buffer_is_hexagon_repack(buffer) &&
+        tensor->name[0] != '\0' &&
+        std::strstr(tensor->name, "_exps.weight") != nullptr;
+
+    if (raw_q4_0_expert_copy) {
+        GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+        sess->enqueue_host_copy((char *) tensor->data + offset, data, size);
+        return;
+    }
+
+    // Preserve the old synchronous behavior for every other tensor, including
+    // waiting for any earlier DSP use of the destination allocation.
+    ggml_backend_hexagon_synchronize(backend);
+    GGML_ASSERT(buffer != nullptr);
+    ggml_backend_hexagon_buffer_set_tensor(buffer, tensor, data, offset, size);
 }
 
 static std::vector<int> ggml_hexagon_graph_optimize_reorder(const std::vector<htp_opnode> & nodes) {
@@ -4644,7 +4853,7 @@ static void ggml_backend_hexagon_graph_optimize(ggml_backend_t backend, ggml_cgr
 static struct ggml_backend_i hexagon_backend_i = {
     /* .get_name                = */ ggml_backend_hexagon_name,
     /* .free                    = */ ggml_backend_hexagon_free,
-    /* .set_tensor_async        = */ NULL,
+    /* .set_tensor_async        = */ ggml_backend_hexagon_set_tensor_async,
     /* .get_tensor_async        = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
@@ -5231,6 +5440,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mbuf     = getenv("GGML_HEXAGON_MBUF");
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_mmid_raw_q4_0 = getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
+    const char * str_host_copy_threads = getenv("GGML_HEXAGON_HOST_COPY_THREADS");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -5265,6 +5475,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_verbose   = str_verbose  ? atoi(str_verbose)                      : 0;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mmid_raw_q4_0 = str_mmid_raw_q4_0 ? atoi(str_mmid_raw_q4_0) : opt_mmid_raw_q4_0;
+    opt_host_copy_threads = str_host_copy_threads ? strtoul(str_host_copy_threads, NULL, 0) : opt_host_copy_threads;
     opt_opstage   = str_opstage  ? strtoul(str_opstage, NULL, 0)          : opt_opstage;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
@@ -5282,6 +5493,12 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mmid_raw_q4_0 = str_mmid_raw_q4_0 ? atoi(str_mmid_raw_q4_0) : opt_mmid_raw_q4_0;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+
+    if (opt_host_copy_threads > 8) {
+        GGML_LOG_WARN("ggml-hex: capping host copy threads at 8 (requested %zu)\n",
+                      opt_host_copy_threads);
+        opt_host_copy_threads = 8;
+    }
 
     if (opt_ndev > GGML_HEXAGON_MAX_SESSIONS) {
         opt_ndev = GGML_HEXAGON_MAX_SESSIONS;

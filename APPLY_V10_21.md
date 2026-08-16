@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.32 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.33 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,23 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.33 targets the bottleneck measured by v10.32 without changing DSP math.
+  The phone copied 4,069.39 MiB of selected raw Q4_0 experts in 3.405688
+  seconds across 3,453 `SET` calls (about 71.4% of measured host time), while
+  all explicit synchronizations together used only 0.071097 seconds.
+- The Hexagon backend now implements `set_tensor_async` only as an optimization
+  for normal-buffer Q4_0 tensors whose name contains `_exps.weight`. Those
+  independent sparse ranges are copied by a persistent host worker pool, then
+  fenced before graph submission, explicit synchronization, and session
+  destruction. All other tensor uploads retain the previous synchronous path.
+- `GGML_HEXAGON_HOST_COPY_THREADS` controls the pool. The helper exposes it as
+  `HOST_COPY_THREADS`, defaults to `4`, caps it at `8`, and records it in
+  metadata. Values `0` and `1` select the original synchronous behavior for a
+  clean A/B fallback. Worker-creation failure also falls back synchronously.
+- `DBG_V133_HOST_COPY_CONFIG` records the active pool and
+  `DBG_V133_HOST_COPY_BATCH` records jobs, bytes and wall time at each graph
+  fence. This is a host-copy experiment; v10.31 DSP conversion and HMX output
+  equations remain byte-for-byte unchanged.
 - v10.32 is a host-side timing build. It leaves the verified v10.31 DSP math
   and memory layout unchanged, and records elapsed microseconds for backend
   tensor uploads/downloads, graph execution and explicit synchronization as
@@ -127,7 +144,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.32.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.33.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -144,11 +161,19 @@ install -m 700 \
 "$HOME/phone-debug.sh" install
 ```
 
-Run the HMX regression case:
+Run one correctness and throughput case:
 
 ```bash
 termux-wake-lock
-PROMPT='你好。' "$HOME/phone-debug.sh" run htp
+PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
+  "$HOME/phone-debug.sh" run htp
+```
+
+If the parallel result is wrong or slower, the exact synchronous control is:
+
+```bash
+PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=1 \
+  "$HOME/phone-debug.sh" run htp
 ```
 
 Leave `GGML_HEXAGON_MMID_RAW_Q4_0=1` enabled. Setting it to `0` selects the
