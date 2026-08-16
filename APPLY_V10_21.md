@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.26 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.27 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,14 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.27 replaces the remaining full-tile strided scalar Q-byte reads with
+  four word-granularity HVX gathers per 32-row K tile. Gather results use the
+  tile's 128-byte scale/alignment area as temporary VTCM storage, so memory use
+  is unchanged. Partial-row tiles retain the byte-equivalent v10.26 fallback.
+- v10.26 reduced prompt evaluation from 54.354 to 43.044 seconds (20.8%) and
+  raw-to-tiled time from 42.784 to 35.191 seconds (17.7%). The result remained
+  correct, but conversion still represented 99.196% of profiled MMID time;
+  v10.27 targets the strided loads left inside that phase.
 - v10.26 optimizes the measured bottleneck without changing the Q4_0 bytes
   consumed by the existing dequantizer. The raw-to-tiled converter now walks
   each raw row once, reuses each adjacent Q-byte pair for both K halves, writes
@@ -65,7 +73,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.26.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.27.tar.gz -C .
 git diff --check
 git status --short
 ```

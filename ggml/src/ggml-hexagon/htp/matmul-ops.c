@@ -1250,6 +1250,11 @@ static void htp_raw_q4_0_32rows_to_tiled(
         uint32_t k,
         uint32_t valid_rows) {
     const uint32_t n_k_tiles = k / 32;
+    int32_t raw_row_offsets[32] __attribute__((aligned(VLEN)));
+    for (uint32_t row = 0; row < 32; ++row) {
+        raw_row_offsets[row] = (int32_t) (row * raw_row_size);
+    }
+    const HVX_Vector v_raw_row_offsets = *(const HVX_Vector *) raw_row_offsets;
 
     for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
         // v10.10 correctness fix:
@@ -1267,6 +1272,50 @@ static void htp_raw_q4_0_32rows_to_tiled(
         // scalar Q-byte loads by 4x and avoids clearing the 576 bytes that are
         // immediately overwritten. Only scales plus the alignment tail need a
         // zero fill; partial-row tiles initialize their missing Q rows to 0x88.
+        if (valid_rows == 32) {
+            // v10.27: gather four adjacent Q bytes from all 32 rows in one
+            // HVX instruction. The 128-byte scale/tail portion of the output
+            // tile is temporary gather storage; it is populated with scales
+            // and zeroed after the four gather groups finish. This keeps the
+            // v10.26 byte equations while removing strided scalar raw loads.
+            uint32_t * gather_words = (uint32_t *) (tile + 512);
+            const uint32_t gather_region = (uint32_t) (32 * raw_row_size - 1);
+
+            #pragma unroll(4)
+            for (uint32_t group = 0; group < 4; ++group) {
+                const uint8_t * gather_base =
+                    raw + kt * HTP_RAW_Q4_0_BLOCK_BYTES + 2 + group * 4;
+                Q6_vgather_ARMVw(
+                    (HVX_Vector *) gather_words,
+                    (size_t) gather_base,
+                    gather_region,
+                    v_raw_row_offsets);
+
+                const uint32_t qp = 2 * group;
+                for (uint32_t row = 0; row < 32; ++row) {
+                    const uint32_t pair = gather_words[row];
+                    tile[qp * 32 + row] =
+                        (uint8_t) ((pair & 0x0000000f) | ((pair >> 4) & 0x000000f0));
+                    tile[(qp + 8) * 32 + row] =
+                        (uint8_t) (((pair >> 4) & 0x0000000f) | ((pair >> 8) & 0x000000f0));
+                    tile[(qp + 1) * 32 + row] =
+                        (uint8_t) (((pair >> 16) & 0x0000000f) | ((pair >> 20) & 0x000000f0));
+                    tile[(qp + 9) * 32 + row] =
+                        (uint8_t) (((pair >> 20) & 0x0000000f) | ((pair >> 24) & 0x000000f0));
+                }
+            }
+
+            uint8_t * scale_dst = tile + 512;
+            for (uint32_t row = 0; row < 32; ++row) {
+                const uint8_t * block =
+                    raw + row * raw_row_size + kt * HTP_RAW_Q4_0_BLOCK_BYTES;
+                memcpy(scale_dst + 2 * row, block, 2);
+            }
+            memset(tile + HTP_MM_WEIGHT_TILE_SIZE_Q4_0, 0,
+                   HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 - HTP_MM_WEIGHT_TILE_SIZE_Q4_0);
+            continue;
+        }
+
         if (valid_rows < 32) {
             memset(tile, 0x88, 512);
         }

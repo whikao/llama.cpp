@@ -126,7 +126,7 @@ GGML_HEXAGON_TRACE_START=blk.0.ffn_gate_exps
 GGML_HEXAGON_TRACE_COUNT=8
 ```
 
-The v10.26 low-memory HMX path keeps `GGML_HEXAGON_MMID_RAW_Q4_0=1`. It
+The v10.27 low-memory HMX path keeps `GGML_HEXAGON_MMID_RAW_Q4_0=1`. It
 converts only the current HMX weight chunk from raw GGUF Q4_0 into tiled form
 inside the two existing VTCM work areas. The independent 32-row layout
 transforms run on the existing HTP worker pool; the transformed bytes and HMX
@@ -140,6 +140,13 @@ v10.26 keeps the same output layout but scans raw rows once, derives both K
 halves from each loaded Q-byte pair, packs two output rows per store, and skips
 the redundant full logical-tile clear. The `DBG_V125_HMX_RAW_PROFILE` records
 remain enabled so the phone run measures the change directly.
+
+The v10.26 phone run reduced prompt evaluation to 43.044 seconds and
+raw-to-tiled conversion to 35.191 seconds with identical finite-output checks.
+v10.27 gathers four adjacent Q bytes from all 32 rows at once for each of four
+groups, using the output tile's scale/alignment area as temporary VTCM storage.
+It retains the v10.26 scalar transform for partial-row tiles and does not add a
+buffer or change the tiled byte equations.
 
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
