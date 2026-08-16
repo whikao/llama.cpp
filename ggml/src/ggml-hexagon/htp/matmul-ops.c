@@ -1258,18 +1258,23 @@ static inline uint32_t htp_dbg_v121_load_u32(
 _Static_assert(HTP_MM_WEIGHT_TILE_SIZE_Q4_0 == 576, "unexpected Q4_0 logical tile size");
 _Static_assert(HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 == 640, "unexpected Q4_0 aligned tile stride");
 
+static inline HVX_Vector htp_raw_q4_0_make_row_offsets(
+        size_t raw_row_size) {
+    int32_t raw_row_offsets[32] __attribute__((aligned(VLEN)));
+    for (uint32_t row = 0; row < 32; ++row) {
+        raw_row_offsets[row] = (int32_t) (row * raw_row_size);
+    }
+    return *(const HVX_Vector *) raw_row_offsets;
+}
+
 static void htp_raw_q4_0_32rows_to_tiled(
         const uint8_t * restrict raw,
         size_t raw_row_size,
         uint8_t * restrict tiled,
         uint32_t k,
-        uint32_t valid_rows) {
+        uint32_t valid_rows,
+        HVX_Vector v_raw_row_offsets) {
     const uint32_t n_k_tiles = k / 32;
-    int32_t raw_row_offsets[32] __attribute__((aligned(VLEN)));
-    for (uint32_t row = 0; row < 32; ++row) {
-        raw_row_offsets[row] = (int32_t) (row * raw_row_size);
-    }
-    const HVX_Vector v_raw_row_offsets = *(const HVX_Vector *) raw_row_offsets;
 
     for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
         // v10.10 correctness fix:
@@ -1439,6 +1444,10 @@ static void htp_raw_q4_0_to_tiled_worker(
         void * data) {
     htp_raw_q4_0_tiled_task_state_t * state = data;
     const size_t n_row_tiles = hmx_ceil_div(state->n_rows, 32);
+    // v10.40: every tile handled by this worker has the same raw row stride.
+    // Build the gather offsets once instead of 32 scalar stores per row tile.
+    const HVX_Vector v_raw_row_offsets =
+        htp_raw_q4_0_make_row_offsets(state->raw_row_size);
 
     for (size_t rt = i; rt < n_row_tiles; rt += n) {
         const size_t row = rt * 32;
@@ -1448,7 +1457,8 @@ static void htp_raw_q4_0_to_tiled_worker(
             state->raw_row_size,
             state->tiled + rt * state->tiled_32_rows,
             state->k,
-            valid_rows);
+            valid_rows,
+            v_raw_row_offsets);
     }
 }
 
@@ -1580,6 +1590,8 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     uint8_t * restrict raw_buf = thread_vtcm;
     uint8_t * restrict tiled_buf = thread_vtcm + raw_32_size;
     uint8_t * restrict src1_data = mmctx->vtcm_src1;
+    const HVX_Vector v_raw_row_offsets =
+        htp_raw_q4_0_make_row_offsets(raw_row_size);
 
     for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
@@ -1610,7 +1622,9 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             // Convert only this working set; no model-sized REPACK allocation.
             phase_start_qt =
                 profile_down ? HAP_perf_get_qtimer_count() : 0;
-            htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+            htp_raw_q4_0_32rows_to_tiled(
+                raw_buf, raw_row_size, tiled_buf, ne00, valid_rows,
+                v_raw_row_offsets);
             if (profile_down) {
                 convert_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
                 ++tile_count;
@@ -2293,6 +2307,8 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     uint8_t * restrict raw_buf = thread_vtcm;
     uint8_t * restrict tiled_buf = thread_vtcm + raw_32_size;
     const uint8_t * restrict src1_col = mmctx->vtcm_src1;
+    const HVX_Vector v_raw_row_offsets =
+        htp_raw_q4_0_make_row_offsets(raw_row_size);
 
     const uint32_t n_aids = ids->ne[0];
     const uint32_t n_ids = ne02;
@@ -2319,7 +2335,8 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 raw_row_size, raw_row_size, raw_row_size, valid_rows);
             (void) dma_queue_pop(dma_queue);
             htp_raw_q4_0_32rows_to_tiled(
-                raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+                raw_buf, raw_row_size, tiled_buf, ne00, valid_rows,
+                v_raw_row_offsets);
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
             tiled_vec_dot_q4_0_32x1(

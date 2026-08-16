@@ -193,6 +193,12 @@ kernel unchanged and adds `DBG_V132_HOST_SET`, `HOST_GET`, `HOST_GRAPH` and
 `HOST_SYNC` elapsed-time records. They identify whether the next target is
 sparse expert transfer, graph execution or synchronization.
 
+v10.40 keeps the converter's verified Q4_0 byte equations and hoists its
+32-element gather-offset construction from every 32-row block to once per
+worker. The real down path converted 512 such blocks per call in v10.38, so
+this removes repeated scalar setup without changing gather addresses, VTCM
+layout or dot math.
+
 The v10.38 corrected phase probe captured 297 real `768:8` down calls. Across
 them, raw-to-tiled conversion used 60.58% of summed worker time and residual
 work used 26.85%. v10.39 gates the legacy raw-MMID hashes/scalar references and

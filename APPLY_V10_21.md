@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.39 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.40 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,15 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.40 targets raw-to-tiled bookkeeping without changing the verified
+  converter equations. v10.38 observed 512 converted 32-row blocks per real
+  `768:8` down call. Each block invocation rebuilt the same 32 gather row
+  offsets with a scalar loop even though raw row stride is constant for the
+  whole worker. The offset vector is now constructed once per worker and
+  reused across all selected experts and row tiles. Gather addresses, packed
+  Q4_0 bytes, fp16 scales, aligned 640-byte tile stride, VTCM footprint and dot
+  math are unchanged. This is deliberately a smaller first conversion change
+  before considering a fused raw-Q4_0 dot kernel.
 - v10.39 converts the v10.38 measurement into a production-path cleanup.
   v10.38 successfully captured 297 real `768:8` down calls: raw-to-tiled used
   60.58% of summed worker time, while residual work used 26.85%. Inspection of
@@ -226,7 +235,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.39.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.40.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -241,7 +250,7 @@ Android Hexagon workflow. After it succeeds, install the new rolling release:
 ```
 
 Run one deterministic 32-token production-path validation. Keep all debug
-profilers disabled so the v10.39 cleanup is active. The rejected exact-address
+profilers disabled so the v10.39 cleanup remains active. The rejected exact-address
 cache stays off and four host-copy workers remain the normal setting:
 
 ```bash
