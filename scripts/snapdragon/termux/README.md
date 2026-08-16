@@ -198,13 +198,15 @@ and teardown all fence the pool before HTP can read or release the buffer.
 `HOST_COPY_THREADS=4` enables the experiment; `0` or `1` restores the exact
 synchronous copy behavior without another build.
 
-v10.34 adds an opt-in route-locality measurement before committing memory to
+v10.34.1 adds an opt-in route-locality measurement before committing memory to
 an expert cache. `ROUTE_PROFILE=1` records only exact original
 `ffn_moe_topk-N` tensors and accounts for their padded row stride. At shutdown,
 `DBG_V134_ROUTE_LAYER` reports the top-1/2/4/8 expert coverage and adjacent
 route overlap for every observed layer; `DBG_V134_ROUTE_SUMMARY` aggregates
-each HTP device. It is disabled by default and does not alter routing or DSP
-math. Use the following one-off command:
+each HTP device. The v10.34.1 lifecycle fix emits these records from backend
+release while logging is still active, and `TRACE_START=''` now really disables
+the older tensor trace. It is disabled by default and does not alter routing
+or DSP math. Use the following one-off command:
 
 ```bash
 PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \

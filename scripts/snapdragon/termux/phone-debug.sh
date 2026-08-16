@@ -23,7 +23,9 @@ HTP_NGL="${HTP_NGL:-}"
 NHMX="${NHMX:-1}"
 HOST_COPY_THREADS="${HOST_COPY_THREADS:-4}"
 ROUTE_PROFILE="${ROUTE_PROFILE:-0}"
-TRACE_START="${TRACE_START:-blk.0.ffn_gate_exps}"
+# Use '-' rather than ':-' so TRACE_START='' really disables the older tensor
+# trace for low-overhead route profiling.
+TRACE_START="${TRACE_START-blk.0.ffn_gate_exps}"
 TRACE_COUNT="${TRACE_COUNT:-8}"
 DEBUG_K="${DEBUG_K:-192}"
 MMID_DEBUG="${MMID_DEBUG:-0}"

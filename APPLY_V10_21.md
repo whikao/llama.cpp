@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.34 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.34.1 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,13 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.34.1 fixes the measurement lifecycle found by the first phone run. The
+  registry owns Hexagon sessions for the process lifetime, so session teardown
+  happened after CLI logging was no longer available. Route summaries now
+  print from `backend_free`, which runs while the logger is alive. The helper
+  also preserves `TRACE_START=''` instead of replacing it with the default
+  v10.20 tensor trace. The first v10.34 run itself was healthy (exit `0`, 32
+  generated tokens at 1.65 t/s); only the accumulated summary was missing.
 - v10.34 is a measurement build for the next decision, not another speculative
   cache implementation. With `GGML_HEXAGON_ROUTE_PROFILE=1`, it reads only the
   original `ffn_moe_topk-N` host results, honors their real 512-byte row
@@ -156,7 +163,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.34.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.34.1.tar.gz -C .
 git diff --check
 git status --short
 ```

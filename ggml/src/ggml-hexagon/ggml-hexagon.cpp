@@ -4569,6 +4569,11 @@ static const char * ggml_backend_hexagon_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_hexagon_free(ggml_backend_t backend) {
+    auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    // Registry-owned sessions outlive individual llama backends, so their
+    // destructors do not run before CLI logging shuts down.  Emit the opt-in
+    // route profile while the backend and logger are both still alive.
+    sess->print_moe_route_profile();
     // we just need to delete the backend here
     // the sessions are allocated & freed as part of the registry
     delete backend;
