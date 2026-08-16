@@ -4549,7 +4549,7 @@ static int hmx_mm_op_matmul_id(
     }
 
     if (raw_q4_0) {
-        FARF(HIGH,
+        FARF(ALWAYS,
              "DBG_V125_HMX_RAW_PROFILE experts=%u total_us=%u activation_us=%u raw_dma_us=%u raw_to_tiled_us=%u dequant_us=%u hmx_us=%u output_us=%u",
              raw_profile.expert_calls,
              (unsigned) HAP_perf_qtimer_count_to_us(raw_profile.total_qt),
