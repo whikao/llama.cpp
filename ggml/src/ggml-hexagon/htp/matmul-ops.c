@@ -1290,6 +1290,69 @@ static void htp_raw_q4_0_32rows_to_tiled(
     }
 }
 
+// v10.24: parallelize the low-memory raw-Q4_0 layout transform by assigning
+// independent 32-row output tiles to the HTP worker pool.  Each worker writes
+// a disjoint [row-tile, all-K-tiles] range, so the byte layout is identical to
+// htp_raw_q4_0_32rows_to_tiled() and no synchronization is needed inside the
+// transform.
+typedef struct {
+    const uint8_t * raw;
+    size_t          raw_row_size;
+    uint8_t       * tiled;
+    size_t          n_rows;
+    uint32_t        k;
+    size_t          tiled_32_rows;
+} htp_raw_q4_0_tiled_task_state_t;
+
+static void htp_raw_q4_0_to_tiled_worker(
+        unsigned int n,
+        unsigned int i,
+        void * data) {
+    htp_raw_q4_0_tiled_task_state_t * state = data;
+    const size_t n_row_tiles = hmx_ceil_div(state->n_rows, 32);
+
+    for (size_t rt = i; rt < n_row_tiles; rt += n) {
+        const size_t row = rt * 32;
+        const uint32_t valid_rows = (uint32_t) hex_smin(state->n_rows - row, 32);
+        htp_raw_q4_0_32rows_to_tiled(
+            state->raw + row * state->raw_row_size,
+            state->raw_row_size,
+            state->tiled + rt * state->tiled_32_rows,
+            state->k,
+            valid_rows);
+    }
+}
+
+static void htp_raw_q4_0_to_tiled_threaded(
+        struct htp_context * ctx,
+        const uint8_t * raw,
+        size_t raw_row_size,
+        uint8_t * tiled,
+        size_t n_rows,
+        uint32_t k,
+        uint32_t n_threads) {
+    const size_t n_row_tiles = hmx_ceil_div(n_rows, 32);
+    if (n_row_tiles == 0) {
+        return;
+    }
+
+    htp_raw_q4_0_tiled_task_state_t state = {
+        .raw             = raw,
+        .raw_row_size    = raw_row_size,
+        .tiled           = tiled,
+        .n_rows          = n_rows,
+        .k               = k,
+        .tiled_32_rows   = (size_t) (k / 32) * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0,
+    };
+
+    const uint32_t n_tasks = (uint32_t) hex_smin(n_row_tiles, n_threads);
+    if (n_tasks <= 1) {
+        htp_raw_q4_0_to_tiled_worker(1, 0, &state);
+    } else {
+        worker_pool_run_func(ctx->worker_pool, htp_raw_q4_0_to_tiled_worker, &state, n_tasks);
+    }
+}
+
 static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) {
     htp_matmul_preamble;
 
@@ -4277,16 +4340,9 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                     raw_row_size, raw_row_size, raw_row_size, n_cols);
                 uint8_t * raw_chunk = (uint8_t *) dma_queue_pop(ctx->dma[0]).dst;
                 uint8_t * tiled_chunk = (uint8_t *) vtcm_weight;
-                const size_t tiled_32_rows = (size_t) n_k_tiles * aligned_tile_size;
-
-                for (size_t row = 0; row < n_cols; row += 32) {
-                    htp_raw_q4_0_32rows_to_tiled(
-                        raw_chunk + row * raw_row_size,
-                        raw_row_size,
-                        tiled_chunk + (row / 32) * tiled_32_rows,
-                        (uint32_t) k,
-                        32);
-                }
+                htp_raw_q4_0_to_tiled_threaded(
+                    ctx, raw_chunk, raw_row_size, tiled_chunk,
+                    n_cols, (uint32_t) k, (uint32_t) n_threads);
                 curr_tiled = vtcm_weight;
             } else {
                 // Wait for the already-tiled weight DMA queued above.

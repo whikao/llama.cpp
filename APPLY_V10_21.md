@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.23 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.24 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,14 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- Parallelizes the low-memory raw-Q4_0 to tiled transform added in v10.23.
+  Independent 32-row weight tiles are now distributed across the existing HTP
+  worker pool before the already-threaded dequantizer runs. The byte layout,
+  640-byte aligned K-tile stride, HMX input and memory footprint are unchanged.
+- Targets the v10.23 performance regression where the correct raw-HMX path
+  needed about 461.7 seconds for 10 prompt tokens, versus about 51.6 seconds
+  for the HVX control. This is a performance change; the phone result is still
+  required to measure the actual gain.
 - Fixes the remaining HMX `MUL_MAT_ID` format mismatch exposed by the v10.22
   HMX/HVX comparison. Low-memory mode stages expert weights in original GGUF
   Q4_0 row layout, while the HMX dequantizer previously read those bytes as
@@ -34,7 +42,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.23.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.24.tar.gz -C .
 git diff --check
 git status --short
 ```
