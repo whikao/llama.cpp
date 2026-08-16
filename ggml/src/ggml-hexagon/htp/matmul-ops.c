@@ -196,14 +196,14 @@ struct htp_mm_context {
     uint32_t vtcm_src3_size_per_thread;
     uint32_t vtcm_dst_size_per_thread;
 
-    // v10.37: per-worker qtimer totals for the one-token raw-Q4_0
-    // ffn_down_exps diagnostic.  Each worker owns one index, so no atomics are
+    // v10.38: per-worker qtimer totals for the eight-route-row raw-Q4_0
+    // ffn_down_exps diagnostic. Each worker owns one index, so no atomics are
     // needed and worker_pool_run_func() provides the join before aggregation.
-    uint64_t dbg_v137_worker_qt[HTP_MAX_NTHREADS];
-    uint64_t dbg_v137_dma_qt[HTP_MAX_NTHREADS];
-    uint64_t dbg_v137_convert_qt[HTP_MAX_NTHREADS];
-    uint64_t dbg_v137_dot_qt[HTP_MAX_NTHREADS];
-    uint32_t dbg_v137_tiles[HTP_MAX_NTHREADS];
+    uint64_t dbg_v138_worker_qt[HTP_MAX_NTHREADS];
+    uint64_t dbg_v138_dma_qt[HTP_MAX_NTHREADS];
+    uint64_t dbg_v138_convert_qt[HTP_MAX_NTHREADS];
+    uint64_t dbg_v138_dot_qt[HTP_MAX_NTHREADS];
+    uint32_t dbg_v138_tiles[HTP_MAX_NTHREADS];
 };
 
 // vdelta control to expand first 32 e8m0 values into 32 uint32 elements
@@ -1491,10 +1491,28 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     const uint32_t src0_start_row  = src0_nrows_per_thread * ith;
     const uint32_t src0_end_row    = MIN(src0_start_row + src0_nrows_per_thread, src0_nrows);
 
+    // v10.38: decode-time Qwen3 MoE down arrives as eight routed rows, so it
+    // uses this matrix worker rather than hvx_mv_id_raw_q4_0().  Keep the
+    // probe shape-specific so prompt/gate/up work is not perturbed.
+    const bool profile_down =
+        ne00 == 768 && ne01 == 2048 && mmctx->src1_nrows == 8;
+    mmctx->dbg_v138_worker_qt[ith] = 0;
+    mmctx->dbg_v138_dma_qt[ith] = 0;
+    mmctx->dbg_v138_convert_qt[ith] = 0;
+    mmctx->dbg_v138_dot_qt[ith] = 0;
+    mmctx->dbg_v138_tiles[ith] = 0;
+
     hvx_mm_run_quant_task(mmctx, ith);
     if (src0_start_row >= src0_end_row) {
         return;
     }
+
+    const uint64_t worker_start_qt =
+        profile_down ? HAP_perf_get_qtimer_count() : 0;
+    uint64_t dma_qt = 0;
+    uint64_t convert_qt = 0;
+    uint64_t dot_qt = 0;
+    uint32_t tile_count = 0;
 
     // v10.9: hvx_mm_run_quant_task() does not return until quant_barrier == 0,
     // so vtcm_src1 is fully produced here. Capture only ith==0 to avoid races.
@@ -1576,14 +1594,25 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             valid_rows = MIN(valid_rows, 32u);
 
             // DMA raw GGUF rows into VTCM.
+            uint64_t phase_start_qt =
+                profile_down ? HAP_perf_get_qtimer_count() : 0;
             dma_queue_push(
                 dma_queue,
                 dma_make_ptr(raw_buf, src0_expert + (size_t) ct * 32 * raw_row_size),
                 raw_row_size, raw_row_size, raw_row_size, valid_rows);
             (void) dma_queue_pop(dma_queue);
+            if (profile_down) {
+                dma_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+            }
 
             // Convert only this working set; no model-sized REPACK allocation.
+            phase_start_qt =
+                profile_down ? HAP_perf_get_qtimer_count() : 0;
             htp_raw_q4_0_32rows_to_tiled(raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
+            if (profile_down) {
+                convert_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+                ++tile_count;
+            }
 
             // v10.3: capture the first selected expert into this op's mmctx.
             // The result is copied into the shared kernel_params blob only after all
@@ -2176,8 +2205,13 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     mmctx->dbg_v114_hvx_int_dot = dbg_hvx_int_dot;
                 }
 
+                phase_start_qt =
+                    profile_down ? HAP_perf_get_qtimer_count() : 0;
                 tiled_vec_dot_q4_0_32x1(
                     ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+                if (profile_down) {
+                    dot_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
+                }
 
                 if (dbg_v121_rec) {
                     const uint32_t out_base = ct * 32u;
@@ -2223,6 +2257,15 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
         }
     }
 
+    if (profile_down) {
+        mmctx->dbg_v138_worker_qt[ith] =
+            HAP_perf_get_qtimer_count() - worker_start_qt;
+        mmctx->dbg_v138_dma_qt[ith] = dma_qt;
+        mmctx->dbg_v138_convert_qt[ith] = convert_qt;
+        mmctx->dbg_v138_dot_qt[ith] = dot_qt;
+        mmctx->dbg_v138_tiles[ith] = tile_count;
+    }
+
     (void) nth;
 }
 
@@ -2251,16 +2294,6 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
     const uint32_t n_aids = ids->ne[0];
     const uint32_t n_ids = ne02;
 
-    // Instrument only the known Qwen3-30B-A3B single-token down projection.
-    // This diagnostic build deliberately avoids perturbing gate/up and prompt.
-    const bool profile_down =
-        ne00 == 768 && ne01 == 2048 && mmctx->src1_nrows == 1;
-    uint64_t worker_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
-    uint64_t dma_qt = 0;
-    uint64_t convert_qt = 0;
-    uint64_t dot_qt = 0;
-    uint32_t tile_count = 0;
-
     for (uint32_t ie1 = 0; ie1 < n_aids; ++ie1) {
         const int32_t eid = *(const int32_t *) ((const uint8_t *) ids->data + ie1 * ids->nb[0]);
         if (eid < 0) continue;
@@ -2276,42 +2309,20 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             uint32_t valid_rows = ne01 - ct * 32;
             valid_rows = MIN(valid_rows, 32u);
 
-            uint64_t phase_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
             dma_queue_push(
                 dma_queue,
                 dma_make_ptr(raw_buf,
                              src0_expert + (size_t) ct * 32 * raw_row_size),
                 raw_row_size, raw_row_size, raw_row_size, valid_rows);
             (void) dma_queue_pop(dma_queue);
-            if (profile_down) {
-                dma_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
-            }
-
-            phase_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
             htp_raw_q4_0_32rows_to_tiled(
                 raw_buf, raw_row_size, tiled_buf, ne00, valid_rows);
-            if (profile_down) {
-                convert_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
-            }
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
-            phase_start_qt = profile_down ? HAP_perf_get_qtimer_count() : 0;
             tiled_vec_dot_q4_0_32x1(
                 ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
-            if (profile_down) {
-                dot_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
-                ++tile_count;
-            }
             htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
         }
-    }
-
-    if (profile_down) {
-        mmctx->dbg_v137_worker_qt[ith] = HAP_perf_get_qtimer_count() - worker_start_qt;
-        mmctx->dbg_v137_dma_qt[ith] = dma_qt;
-        mmctx->dbg_v137_convert_qt[ith] = convert_qt;
-        mmctx->dbg_v137_dot_qt[ith] = dot_qt;
-        mmctx->dbg_v137_tiles[ith] = tile_count;
     }
 
     (void) nth;
@@ -4831,7 +4842,7 @@ static int hvx_mm_matmul_id(
     worker_pool_run_func(octx->ctx->worker_pool, hvx_mmid_task_func, mmctx, octx->n_threads);
 
     if (kparams->kernel_type == HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0 &&
-        src1_nrows == 1 && ne00 == 768 && ne01 == 2048) {
+        src1_nrows == 8 && ne00 == 768 && ne01 == 2048) {
         uint64_t worker_qt = 0;
         uint64_t wall_qt = 0;
         uint64_t dma_qt = 0;
@@ -4839,12 +4850,12 @@ static int hvx_mm_matmul_id(
         uint64_t dot_qt = 0;
         uint32_t tiles = 0;
         for (uint32_t ith = 0; ith < octx->n_threads; ++ith) {
-            worker_qt += mmctx->dbg_v137_worker_qt[ith];
-            wall_qt = MAX(wall_qt, mmctx->dbg_v137_worker_qt[ith]);
-            dma_qt += mmctx->dbg_v137_dma_qt[ith];
-            convert_qt += mmctx->dbg_v137_convert_qt[ith];
-            dot_qt += mmctx->dbg_v137_dot_qt[ith];
-            tiles += mmctx->dbg_v137_tiles[ith];
+            worker_qt += mmctx->dbg_v138_worker_qt[ith];
+            wall_qt = MAX(wall_qt, mmctx->dbg_v138_worker_qt[ith]);
+            dma_qt += mmctx->dbg_v138_dma_qt[ith];
+            convert_qt += mmctx->dbg_v138_convert_qt[ith];
+            dot_qt += mmctx->dbg_v138_dot_qt[ith];
+            tiles += mmctx->dbg_v138_tiles[ith];
         }
 
         uint32_t expert_calls = 0;

@@ -254,15 +254,17 @@ That profile also corrected the next target. `ffn_down_exps` is Q4_1 only in
 layers 0--5; layers 6--47 are raw Q4_0 and accounted for about 1.393 seconds of
 the measured down path. The common one-token raw-Q4_0 down call averaged
 3.04 ms, versus about 0.85 and 0.83 ms for gate and up. Since one-token decode
-is below the HMX row threshold, v10.36 tried a per-worker raw/tiled prefetch
-ring in `hvx_mv_id_raw_q4_0`.  Its deterministic output stayed correct, but
-32-token generation regressed from 1.74 t/s to 1.66 t/s, so v10.37 removes the
-ring and restores the v10.35 single-slot worker.  v10.37 is a diagnostic build:
-only the raw-Q4_0 single-token down shape K=768, N=2048 gets phase timers.
-`DBG_V137_HVX_RAW_DOWN_PROFILE` separates DMA, raw-to-tiled conversion and dot
-work.  Run 8 tokens with `PROFILE_MODE=0`, then attach `share-this.tar.gz`;
-timer overhead means this run selects the next target rather than serving as a
-final speed benchmark.
+is below the HMX row threshold. The v10.37 result exposed an important routing
+detail: decode submits all eight selected MoE rows together (`768:8`), so the
+real worker is `hvx_mm_id_raw_q4_0`, not the `768:1`
+`hvx_mv_id_raw_q4_0` function. The v10.36 ring code was therefore not executed
+by that generation test; its 1.66 versus 1.74 t/s difference is treated as
+thermal/frequency or ordinary run variance, not a ring result. v10.38 keeps the
+restored single-slot layout and places phase timers on the actual K=768,
+N=2048, eight-row path. `DBG_V138_HVX_RAW_DOWN_PROFILE` separates DMA,
+raw-to-tiled conversion and dot work. Run 8 tokens with `PROFILE_MODE=0`, then
+attach `share-this.tar.gz`; timer overhead means this run selects the next
+target rather than serving as a final speed benchmark.
 
 Run exactly one initial v10.35 validation:
 
@@ -310,7 +312,7 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
 - `DBG_V125_HMX_RAW_PROFILE` lines: accumulated raw-HMX phase timings for each
   `MUL_MAT_ID`, including raw DMA, layout conversion, dequantization and HMX
   compute.
-- `DBG_V137_HVX_RAW_DOWN_PROFILE` lines: v10.37 single-token raw-Q4_0
+- `DBG_V138_HVX_RAW_DOWN_PROFILE` lines: v10.38 eight-route-row raw-Q4_0
   `ffn_down_exps` worker, wall, DMA, conversion, dot and residual timings.
 - `DBG_V132_HOST_*` lines: host tensor-copy, graph-execution and synchronization
   elapsed times from the v10.32 timing build.

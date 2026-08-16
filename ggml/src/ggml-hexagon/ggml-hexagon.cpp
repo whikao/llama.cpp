@@ -2367,7 +2367,7 @@ struct ggml_hexagon_opqueue {
                 p.raw_to_tiled_us, p.dequant_us, p.hmx_us, p.output_us);
         }
 
-        // v10.37 single-token raw-Q4_0 ffn_down_exps phase totals.
+        // v10.38 eight-route-row raw-Q4_0 ffn_down_exps phase totals.
         if (rsp.dbg_hvx_raw_decode_profile.valid) {
             const auto & p = rsp.dbg_hvx_raw_decode_profile;
             const uint32_t measured_us =
@@ -2375,7 +2375,7 @@ struct ggml_hexagon_opqueue {
             const uint32_t residual_us =
                 p.worker_us > measured_us ? p.worker_us - measured_us : 0;
             GGML_LOG_INFO(
-                "DBG_V137_HVX_RAW_DOWN_PROFILE: dev=%s batch=%u ops=%u "
+                "DBG_V138_HVX_RAW_DOWN_PROFILE: dev=%s batch=%u ops=%u "
                 "experts=%u tiles=%u ne00=%u ne01=%u worker_us=%u "
                 "wall_us=%u raw_dma_us=%u raw_to_tiled_us=%u dot_us=%u "
                 "residual_us=%u\n",
