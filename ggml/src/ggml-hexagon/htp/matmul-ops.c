@@ -1223,6 +1223,30 @@ static inline uint8_t htp_raw_q4_0_get_nibble(const uint8_t * qs, uint32_t q) {
     return qs[q - 16] >> 4;
 }
 
+static inline uint8_t htp_raw_q4_0_pair_lo01(uint32_t pair) {
+    return (uint8_t) ((pair & 0x0000000f) | ((pair >> 4) & 0x000000f0));
+}
+
+static inline uint8_t htp_raw_q4_0_pair_hi01(uint32_t pair) {
+    return (uint8_t) (((pair >> 4) & 0x0000000f) | ((pair >> 8) & 0x000000f0));
+}
+
+static inline uint8_t htp_raw_q4_0_pair_lo23(uint32_t pair) {
+    return (uint8_t) (((pair >> 16) & 0x0000000f) | ((pair >> 20) & 0x000000f0));
+}
+
+static inline uint8_t htp_raw_q4_0_pair_hi23(uint32_t pair) {
+    return (uint8_t) (((pair >> 20) & 0x0000000f) | ((pair >> 24) & 0x000000f0));
+}
+
+static inline uint32_t htp_raw_q4_0_pack_4rows(
+        uint8_t row0, uint8_t row1, uint8_t row2, uint8_t row3) {
+    return (uint32_t) row0 |
+           ((uint32_t) row1 << 8) |
+           ((uint32_t) row2 << 16) |
+           ((uint32_t) row3 << 24);
+}
+
 static inline uint32_t htp_dbg_v121_fnv1a(
         const uint8_t * data, size_t n) {
     uint32_t h = 2166136261u;
@@ -1298,17 +1322,35 @@ static void htp_raw_q4_0_32rows_to_tiled(
                     gather_region,
                     v_group_offsets);
 
+                // v10.29: retain the verified v10.28 gather and byte equations,
+                // but pack four result rows into each scalar store. This cuts
+                // the gather post-processing loop and store count by 4x without
+                // introducing a new HVX permutation or changing byte order.
                 const uint32_t qp = 2 * group;
-                for (uint32_t row = 0; row < 32; ++row) {
-                    const uint32_t pair = gather_words[row];
-                    tile[qp * 32 + row] =
-                        (uint8_t) ((pair & 0x0000000f) | ((pair >> 4) & 0x000000f0));
-                    tile[(qp + 8) * 32 + row] =
-                        (uint8_t) (((pair >> 4) & 0x0000000f) | ((pair >> 8) & 0x000000f0));
-                    tile[(qp + 1) * 32 + row] =
-                        (uint8_t) (((pair >> 16) & 0x0000000f) | ((pair >> 20) & 0x000000f0));
-                    tile[(qp + 9) * 32 + row] =
-                        (uint8_t) (((pair >> 20) & 0x0000000f) | ((pair >> 24) & 0x000000f0));
+                #pragma unroll(8)
+                for (uint32_t row = 0; row < 32; row += 4) {
+                    const uint32_t pair0 = gather_words[row + 0];
+                    const uint32_t pair1 = gather_words[row + 1];
+                    const uint32_t pair2 = gather_words[row + 2];
+                    const uint32_t pair3 = gather_words[row + 3];
+
+                    const uint32_t lo01_rows = htp_raw_q4_0_pack_4rows(
+                        htp_raw_q4_0_pair_lo01(pair0), htp_raw_q4_0_pair_lo01(pair1),
+                        htp_raw_q4_0_pair_lo01(pair2), htp_raw_q4_0_pair_lo01(pair3));
+                    const uint32_t hi01_rows = htp_raw_q4_0_pack_4rows(
+                        htp_raw_q4_0_pair_hi01(pair0), htp_raw_q4_0_pair_hi01(pair1),
+                        htp_raw_q4_0_pair_hi01(pair2), htp_raw_q4_0_pair_hi01(pair3));
+                    const uint32_t lo23_rows = htp_raw_q4_0_pack_4rows(
+                        htp_raw_q4_0_pair_lo23(pair0), htp_raw_q4_0_pair_lo23(pair1),
+                        htp_raw_q4_0_pair_lo23(pair2), htp_raw_q4_0_pair_lo23(pair3));
+                    const uint32_t hi23_rows = htp_raw_q4_0_pack_4rows(
+                        htp_raw_q4_0_pair_hi23(pair0), htp_raw_q4_0_pair_hi23(pair1),
+                        htp_raw_q4_0_pair_hi23(pair2), htp_raw_q4_0_pair_hi23(pair3));
+
+                    memcpy(tile + qp * 32 + row, &lo01_rows, sizeof(lo01_rows));
+                    memcpy(tile + (qp + 8) * 32 + row, &hi01_rows, sizeof(hi01_rows));
+                    memcpy(tile + (qp + 1) * 32 + row, &lo23_rows, sizeof(lo23_rows));
+                    memcpy(tile + (qp + 9) * 32 + row, &hi23_rows, sizeof(hi23_rows));
                 }
             }
 

@@ -157,6 +157,13 @@ offsets. Do not use the v10.27 build identified by commit `2c47573` for model
 output; it is retained only as the diagnostic result that established the
 addressing correction.
 
+The v10.28 phone run generated the correct `你好` token in 14.036 seconds and
+matched the full scalar reference. Its 135 profile records still attributed
+8.323 of 8.605 MMID seconds (96.723%) to raw-to-tiled conversion. v10.29 keeps
+the verified gather addresses and byte equations, but packs four gathered rows
+into each 32-bit scalar store. This reduces the gather post-processing loop and
+store count by 4x without adding a new HVX permutation or memory allocation.
+
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 

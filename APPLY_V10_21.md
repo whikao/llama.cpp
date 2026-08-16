@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.28 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.29 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,17 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.29 keeps the verified v10.28 HVX word gather and its exact byte
+  equations, then handles four gathered rows per scalar iteration. Four
+  adjacent output bytes are assembled into one 32-bit value and written with
+  one store, reducing the gather post-processing loop and scalar store count
+  by 4x. It deliberately avoids an unverified HVX byte permutation.
+- The v10.28 phone run is correct and fast: exit code `0`, generated token
+  `你好`, all 28 diagnostic slices finite, and the first full reference differs
+  by only `-5.36e-09`. Prompt evaluation fell from the correct v10.26 result
+  of 43.044 seconds to 14.036 seconds (3.07x faster). Across 135 profile
+  records and 4,797 selected-expert calls, raw-to-tiled conversion still used
+  8.323 of 8.605 MMID seconds (96.723%), which is the v10.29 target.
 - v10.28 fixes the v10.27 gather address observed on the phone. Passing
   `raw + 2` as the word-gather base caused the target to round the base down
   and gather Q4_0 scale bytes: the first packed byte became `0xd4` from scale
@@ -87,7 +98,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.28.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.29.tar.gz -C .
 git diff --check
 git status --short
 ```
