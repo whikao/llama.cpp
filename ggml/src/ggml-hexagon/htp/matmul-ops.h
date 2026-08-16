@@ -68,6 +68,10 @@ enum htp_mm_kernel_type {
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
     HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, // row-wise fallback flat quantization
     HTP_MM_KERNEL_HVX_QUANT_ROW_RAW_Q4_0, // EXPERIMENTAL MMID: raw GGUF Q4_0 -> VTCM tiled
+
+    // Low-memory HMX MMID path. Kept after the existing values so the numeric
+    // ABI of all pre-v10.23 kernel types remains unchanged.
+    HTP_MM_KERNEL_HMX_2D_RAW_Q4_0,
 };
 
 // Op-specific struct for precomputed matmul params

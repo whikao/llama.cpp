@@ -2900,6 +2900,11 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
     const int n_threads = (int)sess->n_threads;
     const int ne10 = src1->ne[0];
+    const bool raw_q4_0_mmid =
+        is_matmul_id &&
+        opt_mmid_raw_q4_0 &&
+        wtype == GGML_TYPE_Q4_0 &&
+        (!src0->buffer || !ggml_backend_buffer_is_hexagon_repack(src0->buffer));
 
     const bool is_batched_val = is_matmul_id ? false : is_batched;
     const int group_size = (ne02 > 0 ? ne12 / ne02 : 1);
@@ -2944,12 +2949,17 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
 
     if (is_batched && !is_matmul_id) {
         kparams->kernel_type = HTP_MM_KERNEL_HMX_F16_BATCHED;
+    } else if (raw_q4_0_mmid) {
+        static bool logged_raw_hmx = false;
+        if (!logged_raw_hmx) {
+            GGML_LOG_INFO("DBG_HMX_RAW_Q4_0_SELECT: using per-chunk VTCM raw-to-tiled conversion\n");
+            logged_raw_hmx = true;
+        }
+        kparams->kernel_type = HTP_MM_KERNEL_HMX_2D_RAW_Q4_0;
     } else {
         kparams->kernel_type = HTP_MM_KERNEL_HMX_2D;
     }
     return true;
-
-    GGML_UNUSED(src0);
 }
 
 static void ggml_hexagon_precompute_hvx_mm_params(

@@ -4139,6 +4139,7 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
                                          size_t dst_nb1, size_t dst_nb2,
                                          int weight_stride,
                                          int weight_type,
+                                         bool raw_q4_0,
                                          const struct mmid_row_mapping *matrix_rows,
                                          int cur_a,
                                          int mapping_stride) {
@@ -4150,6 +4151,12 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
 
     if (k % 32 != 0 || n % 32 != 0) { return -1; }
     if (!hex_is_aligned(dst, VLEN) || !hex_is_aligned(activation, VLEN)) { return -1; }
+    if (raw_q4_0 &&
+        (weight_type != HTP_TYPE_Q4_0 ||
+         weight_stride != (k / 32) * (int) HTP_RAW_Q4_0_BLOCK_BYTES)) {
+        FARF(ERROR, "hmx-mm-id-2d: invalid raw Q4_0 row stride %d for k %d", weight_stride, k);
+        return -1;
+    }
 
     size_t row_stride = htp_mm_get_tiled_row_stride(weight_type, k);
     if (row_stride == 0) {
@@ -4235,8 +4242,10 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
             ctx, vtcm_f16_act, activation, (int) mr, (int) n_rows, k,
             matrix_rows, cur_a, mapping_stride, ne11, act_nb1, act_nb2, cne1, n_threads, k_valid);
 
-        // A0: Pre-fetch the first weight chunk (nc = 0)
-        if (n > 0) {
+        // A0: Pre-fetch the first already-tiled weight chunk (nc = 0).
+        // Raw Q4_0 is loaded synchronously per chunk below because the raw
+        // staging area reuses vtcm_scratch0 before that area becomes FP16.
+        if (!raw_q4_0 && n > 0) {
             const size_t n_cols = hex_smin((size_t) n, n_chunk_n_cols);
             const uint32_t height = is_quant ? (n_cols / 32) * n_k_tiles : n_cols;
             dma_queue_push(ctx->dma[0], dma_make_ptr(vtcm_weight, weight),
@@ -4247,22 +4256,57 @@ static int hmx_mm_id_2d_f32(struct htp_context *ctx,
             const size_t n_cols = hex_smin((size_t) n - nc, n_chunk_n_cols);
             const size_t n_col_tiles = hmx_ceil_div(n_cols, HTP_MM_HMX_TILE_N_COLS);
 
-            // A: Wait for weight DMA
-            void * curr_raw = dma_queue_pop(ctx->dma[0]).dst;
+            // A: Load one weight chunk. In low-memory raw-Q4_0 mode, stage raw
+            // GGUF rows in the existing FP16 scratch area, then convert only
+            // this chunk into the existing tiled-weight area. No model-sized
+            // HTP_REPACK allocation and no additional VTCM reservation.
+            void * curr_tiled = NULL;
+            if (raw_q4_0) {
+                const size_t raw_row_size = (size_t) weight_stride;
+                const size_t raw_chunk_size = n_cols * raw_row_size;
+                if (raw_chunk_size > scratch0_size) {
+                    FARF(ERROR,
+                         "hmx-mm-id-2d: raw chunk too large: raw %zu scratch %zu",
+                         raw_chunk_size, scratch0_size);
+                    return -1;
+                }
+
+                dma_queue_push(
+                    ctx->dma[0],
+                    dma_make_ptr(vtcm_scratch0, weight + nc * raw_row_size),
+                    raw_row_size, raw_row_size, raw_row_size, n_cols);
+                uint8_t * raw_chunk = (uint8_t *) dma_queue_pop(ctx->dma[0]).dst;
+                uint8_t * tiled_chunk = (uint8_t *) vtcm_weight;
+                const size_t tiled_32_rows = (size_t) n_k_tiles * aligned_tile_size;
+
+                for (size_t row = 0; row < n_cols; row += 32) {
+                    htp_raw_q4_0_32rows_to_tiled(
+                        raw_chunk + row * raw_row_size,
+                        raw_row_size,
+                        tiled_chunk + (row / 32) * tiled_32_rows,
+                        (uint32_t) k,
+                        32);
+                }
+                curr_tiled = vtcm_weight;
+            } else {
+                // Wait for the already-tiled weight DMA queued above.
+                curr_tiled = dma_queue_pop(ctx->dma[0]).dst;
+            }
 
             // B: Weight Dequantize (Threaded)
             dequantize_tiled_weight_chunk_to_fp16_tiles(
-                ctx, vtcm_scratch0, curr_raw,
+                ctx, vtcm_scratch0, curr_tiled,
                 n_cols, k, row_stride, weight_type,
                 n_k_tiles, n_k_tiles_div, dequant_worker_fn, n_threads
             );
 
-            // Start weight DMA for the next chunk early
+            // Start the next already-tiled DMA early. Raw Q4_0 cannot prefetch
+            // here because vtcm_scratch0 now contains the current FP16 weights.
             const size_t nc_next = nc + n_chunk_n_cols;
-            if (nc_next < (size_t) n) {
+            if (!raw_q4_0 && nc_next < (size_t) n) {
                 const size_t n_cols_next = hex_smin((size_t) n - nc_next, n_chunk_n_cols);
                 const uint32_t height_next = is_quant ? (n_cols_next / 32) * n_k_tiles : n_cols_next;
-                dma_queue_push(ctx->dma[0], dma_make_ptr(curr_raw, weight + nc_next * weight_stride),
+                dma_queue_push(ctx->dma[0], dma_make_ptr(curr_tiled, weight + nc_next * weight_stride),
                                dma_dst_stride, dma_src_stride, dma_width_bytes, height_next);
             }
 
@@ -4378,6 +4422,7 @@ static int hmx_mm_op_matmul_id(
     const struct htp_mm_kernel_params * kparams = (const struct htp_mm_kernel_params *) octx->kernel_params;
     const int n_ids = octx->src[2]->ne[0];
     const int n_as  = ne02;
+    const bool raw_q4_0 = kparams->kernel_type == HTP_MM_KERNEL_HMX_2D_RAW_Q4_0;
 
     for (uint32_t cur_a = 0; cur_a < n_as; ++cur_a) {
         const int32_t cne1 = matrix_row_counts[cur_a];
@@ -4391,6 +4436,7 @@ static int hmx_mm_op_matmul_id(
                                    nb11, nb12,
                                    nb1, nb2,
                                    (int) src0->nb[1], (int) src0->type,
+                                   raw_q4_0,
                                    matrix_rows, cur_a, mmctx->mapping_stride);
         if (ret != 0) {
             FARF(ERROR, "HMX matmul failed for expert %u, error %d\n", cur_a, ret);

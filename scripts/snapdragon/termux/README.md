@@ -126,7 +126,13 @@ GGML_HEXAGON_TRACE_START=blk.0.ffn_gate_exps
 GGML_HEXAGON_TRACE_COUNT=8
 ```
 
-The v10.21 diagnostic build can switch the MMID activation quantizer without
+The v10.23 low-memory HMX path keeps `GGML_HEXAGON_MMID_RAW_Q4_0=1`. It
+converts only the current HMX weight chunk from raw GGUF Q4_0 into tiled form
+inside the two existing VTCM work areas. Do not set the variable to `0` on a
+memory-constrained phone: normal HTP_REPACK placement needs roughly 15 GiB for
+this model and may be killed by Android.
+
+The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 
 ```bash

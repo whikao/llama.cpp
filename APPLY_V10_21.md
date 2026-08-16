@@ -1,11 +1,20 @@
-# Hexagon HMX MMID v10.22 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.23 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
-v10.21 note instead of leaving a second stale file.
+v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- Fixes the remaining HMX `MUL_MAT_ID` format mismatch exposed by the v10.22
+  HMX/HVX comparison. Low-memory mode stages expert weights in original GGUF
+  Q4_0 row layout, while the HMX dequantizer previously read those bytes as
+  already-tiled weights.
+- Keeps the model in host/raw storage. For each HMX output-column chunk, raw
+  rows are DMA-copied into the existing FP16 scratch area, converted into the
+  existing tiled-weight area, then dequantized back into the reused FP16
+  scratch area. It does not create the roughly 15 GiB model-sized HTP_REPACK
+  allocation and does not add another VTCM reservation.
 - Fixes the HMX `MUL_MAT_ID` gathered/scattered row workers used by the
   `ne2=10` prompt batch. Padded 32-row chunks were split between eight workers
   even when an expert had only one or two valid rows. Unsigned subtraction
@@ -25,7 +34,7 @@ v10.21 note instead of leaving a second stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-mmid-v10.22.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.23.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -48,6 +57,9 @@ Run the HMX regression case:
 termux-wake-lock
 PROMPT='你好。' "$HOME/phone-debug.sh" run htp
 ```
+
+Leave `GGML_HEXAGON_MMID_RAW_Q4_0=1` enabled. Setting it to `0` selects the
+model-sized HTP_REPACK placement and can be killed by Android on this phone.
 
 The helper prints the exact `share-this.tar.gz` path at the end. Attach that
 small archive to the debugging chat. If an HVX-only comparison is requested,
