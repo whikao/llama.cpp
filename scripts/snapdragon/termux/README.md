@@ -104,6 +104,7 @@ The main environment variables are:
 | `NHMX` | `1` | Enable HMX; use `0` for an HVX-only diagnostic run |
 | `HOST_COPY_THREADS` | `4` | Parallel raw-Q4_0 expert staging workers; `0` or `1` restores synchronous copies |
 | `ROUTE_PROFILE` | `0` | Set to `1` only to measure per-layer MoE expert locality |
+| `EXPERT_COPY_CACHE` | `0` | Exact-address expert-copy reuse; set to `1` only for the v10.35 test |
 | `TRACE_START` | `blk.0.ffn_gate_exps` | Hexagon trace start tensor |
 | `TRACE_COUNT` | `8` | Trace checkpoint count |
 | `DEBUG_K` | `192` | Hexagon debug K value |
@@ -121,6 +122,7 @@ GGML_HEXAGON_NDEV=4
 GGML_HEXAGON_NHMX=1
 GGML_HEXAGON_HOST_COPY_THREADS=4
 GGML_HEXAGON_ROUTE_PROFILE=0
+GGML_HEXAGON_EXPERT_COPY_CACHE=0
 GGML_HEXAGON_MMID_RAW_Q4_0=1
 GGML_HEXAGON_HOSTBUF=1
 GGML_HEXAGON_VERBOSE=1
@@ -213,6 +215,31 @@ PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
 ROUTE_PROFILE=1 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
   "$HOME/phone-debug.sh" run htp
 ```
+
+The complete 48-layer trace then supplied the cache decision directly. Across
+29 decode transitions, adjacent-token route overlap was 49.60%. A static
+top-8 cache covered only 52.13% of selections while retaining about 648 MiB
+across both expert weight tensors, so v10.35 does not add a weight allocation.
+Instead, `EXPERT_COPY_CACHE=1` keeps only a small address/content validity
+table for the existing sparse staging ranges. It skips a copy only when the
+exact immutable source bytes are still valid at the exact destination range.
+Ordinary host writes, DSP graph outputs and overlapping replacements invalidate
+entries. `DBG_V135_EXPERT_COPY_CACHE` reports the measured copy and byte hit
+rates; the feature remains off by default.
+
+Run exactly one initial v10.35 validation:
+
+```bash
+PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
+EXPERT_COPY_CACHE=1 ROUTE_PROFILE=0 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
+  "$HOME/phone-debug.sh" run htp --seed 1234 --temp 0
+```
+
+The output must remain coherent and the summary must show exit code `0` with
+no non-finite values. Attach `share-this.tar.gz`; its cache counters decide
+whether this optimization stays. `HOST_COPY_THREADS=8` remains an optional
+short-burst test only. Four workers remain the default because the earlier
+logs did not contain temperature measurements.
 
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:

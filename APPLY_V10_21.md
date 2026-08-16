@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.34.1 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.35 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,18 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.35 uses the completed 48-layer route trace to avoid a costly static
+  cache. Across 29 decode transitions, adjacent-token route overlap was
+  49.60%, but a static top-8 expert cache covered only 52.13% and would retain
+  about 648 MiB across gate/up expert weights. This build adds no weight
+  allocation. Its opt-in `GGML_HEXAGON_EXPERT_COPY_CACHE=1` table instead
+  remembers when the exact immutable source bytes are still valid at the exact
+  existing sparse-staging address. Exact repeats skip only the redundant host
+  copy. Overlapping host writes and DSP graph outputs invalidate entries, so
+  allocator reuse cannot silently accept stale data. The default remains off.
+- `DBG_V135_EXPERT_COPY_CACHE` reports hit/miss counts and byte hit rate during
+  backend release. The helper exposes this as `EXPERT_COPY_CACHE=0|1`, validates
+  it, exports it and records it in run metadata.
 - v10.34.1 fixes the measurement lifecycle found by the first phone run. The
   registry owns Hexagon sessions for the process lifetime, so session teardown
   happened after CLI logging was no longer available. Route summaries now
@@ -163,7 +175,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.34.1.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.35.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -180,22 +192,25 @@ install -m 700 \
 "$HOME/phone-debug.sh" install
 ```
 
-Run the one route-profile case needed for the cache decision. Disabling the
-older verbose and tensor-slice traces keeps this measurement lightweight:
+Run one deterministic v10.35 cache validation. Disabling the older route,
+verbose and tensor-slice traces keeps this measurement lightweight:
 
 ```bash
 termux-wake-lock
 PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
-ROUTE_PROFILE=1 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
-  "$HOME/phone-debug.sh" run htp
+EXPERT_COPY_CACHE=1 ROUTE_PROFILE=0 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
+  "$HOME/phone-debug.sh" run htp --seed 1234 --temp 0
 ```
 
-Attach the generated `share-this.tar.gz`. The route percentages determine
-whether the next build should implement a small expert cache or skip that
-memory cost and instead overlap staging with compute.
+Attach the generated `share-this.tar.gz`. The text must remain coherent, the
+run must exit `0`, and the finite checks must stay clean. The
+`DBG_V135_EXPERT_COPY_CACHE` byte hit rate and timings determine whether this
+optimization stays. It uses only a small metadata table, not another model
+weight cache.
 
-For ordinary runs leave `ROUTE_PROFILE=0`. If parallel copying is wrong or
-slower, the exact synchronous control remains:
+For ordinary runs leave `ROUTE_PROFILE=0` and `EXPERT_COPY_CACHE=0`. If the
+cache test is wrong or slower, leave it at zero. If parallel copying is wrong
+or slower, the exact synchronous control remains:
 
 ```bash
 PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=1 \

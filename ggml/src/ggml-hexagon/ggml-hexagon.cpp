@@ -18,6 +18,8 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <iterator>
+#include <map>
 #include <unordered_set>
 #include <unordered_map>
 #include <cerrno>
@@ -80,6 +82,7 @@ static int    opt_hostbuf = 1; // hostbuf ON by default
 static int    opt_mmid_raw_q4_0 = 0; // EXPERIMENTAL: keep Q4_0 MUL_MAT_ID weights on host; scheduler stages raw copies
 static size_t opt_host_copy_threads = 4; // v10.33: parallel host copies for sparse raw-Q4_0 expert staging
 static int    opt_route_profile = 0; // v10.34: profile MoE route locality without changing execution
+static int    opt_expert_copy_cache = 0; // v10.35: skip byte-identical expert copies still resident at the destination
 
 static constexpr size_t GGML_HEXAGON_ROUTE_MAX_EXPERTS = 256;
 
@@ -427,6 +430,12 @@ struct ggml_hexagon_session {
         bool have_last = false;
     };
 
+    struct expert_copy_cache_entry {
+        uintptr_t    end = 0;
+        const void * source = nullptr;
+        size_t       size = 0;
+    };
+
     std::string      name;
     remote_handle64  handle;
     dspqueue_t       queue;
@@ -471,6 +480,17 @@ struct ggml_hexagon_session {
     std::unordered_map<int, route_layer_stats> route_profile_layers;
     bool                                     route_profile_printed = false;
 
+    // This is an address-content validity table, not another weight cache.
+    // The sparse staging allocation already exists.  A hit means the same
+    // immutable model bytes are still present at the exact destination range.
+    std::mutex                                  expert_copy_cache_mutex;
+    std::map<uintptr_t, expert_copy_cache_entry> expert_copy_cache;
+    uint64_t                                    expert_copy_cache_hits = 0;
+    uint64_t                                    expert_copy_cache_misses = 0;
+    uint64_t                                    expert_copy_cache_hit_bytes = 0;
+    uint64_t                                    expert_copy_cache_miss_bytes = 0;
+    bool                                        expert_copy_cache_printed = false;
+
     uint32_t n_threads = 0;
     uint32_t n_hvx     = 0;
     uint32_t n_hmx     = 0;
@@ -502,6 +522,10 @@ struct ggml_hexagon_session {
     void record_moe_routes(const ggml_tensor * tensor, const void * data,
                            size_t offset, size_t size);
     void print_moe_route_profile();
+
+    bool expert_copy_cache_hit(void * destination, const void * source, size_t size);
+    void invalidate_expert_copy_cache(void * destination, size_t size);
+    void print_expert_copy_cache_stats();
 
     void flush_pending(bool all = false);
     void flush_batch();
@@ -638,6 +662,7 @@ static ggml_hexagon_session * ggml_backend_hexagon_buffer_get_sess(ggml_backend_
 
 static void ggml_backend_hexagon_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
+    sbuf->sess->invalidate_expert_copy_cache(sbuf->base, sbuf->size);
     delete sbuf;
 }
 
@@ -1165,6 +1190,8 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto sess = sbuf->sess;
     const int64_t host_start_us = opt_verbose ? ggml_time_us() : 0;
 
+    sess->invalidate_expert_copy_cache((char *) tensor->data + offset, size);
+
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
     switch (tensor->type) {
@@ -1497,6 +1524,102 @@ void ggml_hexagon_session::print_moe_route_profile() {
         100.0 * total_top8 / selection_denom, 100.0 * total_overlap / overlap_denom);
 }
 
+bool ggml_hexagon_session::expert_copy_cache_hit(void * destination,
+                                                 const void * source,
+                                                 size_t size) {
+    if (!opt_expert_copy_cache || size == 0) {
+        return false;
+    }
+
+    const uintptr_t start = (uintptr_t) destination;
+    if (start > UINTPTR_MAX - size) {
+        return false;
+    }
+    const uintptr_t end = start + size;
+
+    std::lock_guard<std::mutex> lock(this->expert_copy_cache_mutex);
+    auto exact = this->expert_copy_cache.find(start);
+    if (exact != this->expert_copy_cache.end() &&
+        exact->second.end == end && exact->second.source == source &&
+        exact->second.size == size) {
+        ++this->expert_copy_cache_hits;
+        this->expert_copy_cache_hit_bytes += size;
+        return true;
+    }
+
+    auto it = this->expert_copy_cache.lower_bound(start);
+    if (it != this->expert_copy_cache.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.end > start) {
+            it = prev;
+        }
+    }
+    while (it != this->expert_copy_cache.end() && it->first < end) {
+        if (it->second.end > start) {
+            it = this->expert_copy_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    this->expert_copy_cache[start] = {end, source, size};
+    ++this->expert_copy_cache_misses;
+    this->expert_copy_cache_miss_bytes += size;
+    return false;
+}
+
+void ggml_hexagon_session::invalidate_expert_copy_cache(void * destination,
+                                                        size_t size) {
+    if (!opt_expert_copy_cache || destination == nullptr || size == 0) {
+        return;
+    }
+
+    const uintptr_t start = (uintptr_t) destination;
+    if (start > UINTPTR_MAX - size) {
+        return;
+    }
+    const uintptr_t end = start + size;
+
+    std::lock_guard<std::mutex> lock(this->expert_copy_cache_mutex);
+    auto it = this->expert_copy_cache.lower_bound(start);
+    if (it != this->expert_copy_cache.begin()) {
+        auto prev = std::prev(it);
+        if (prev->second.end > start) {
+            it = prev;
+        }
+    }
+    while (it != this->expert_copy_cache.end() && it->first < end) {
+        if (it->second.end > start) {
+            it = this->expert_copy_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ggml_hexagon_session::print_expert_copy_cache_stats() {
+    if (!opt_expert_copy_cache) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(this->expert_copy_cache_mutex);
+    if (this->expert_copy_cache_printed) {
+        return;
+    }
+    this->expert_copy_cache_printed = true;
+    const uint64_t copies = this->expert_copy_cache_hits + this->expert_copy_cache_misses;
+    const uint64_t bytes = this->expert_copy_cache_hit_bytes + this->expert_copy_cache_miss_bytes;
+    GGML_LOG_INFO(
+        "DBG_V135_EXPERT_COPY_CACHE: dev=%s hits=%" PRIu64 " misses=%" PRIu64
+        " hit_pct=%.3f hit_bytes=%" PRIu64 " miss_bytes=%" PRIu64
+        " byte_hit_pct=%.3f entries=%zu\n",
+        this->c_name(), this->expert_copy_cache_hits, this->expert_copy_cache_misses,
+        copies ? 100.0 * this->expert_copy_cache_hits / copies : 0.0,
+        this->expert_copy_cache_hit_bytes, this->expert_copy_cache_miss_bytes,
+        bytes ? 100.0 * this->expert_copy_cache_hit_bytes / bytes : 0.0,
+        this->expert_copy_cache.size());
+}
+
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
                                                    const ggml_tensor *   tensor,
                                                    void *                data,
@@ -1579,6 +1702,7 @@ static void ggml_backend_hexagon_buffer_clear(ggml_backend_buffer_t buffer, uint
     auto sbuf = (ggml_hexagon_shared_buffer *) buffer->context;
     auto sess = sbuf->sess;
     HEX_VERBOSE("ggml-hex: %s clear-buff base %p size %zu\n", sess->c_name(), (void *) sbuf->base, sbuf->size);
+    sess->invalidate_expert_copy_cache(sbuf->base, sbuf->size);
     memset(sbuf->base, value, sbuf->size);
 }
 
@@ -4574,6 +4698,7 @@ static void ggml_backend_hexagon_free(ggml_backend_t backend) {
     // destructors do not run before CLI logging shuts down.  Emit the opt-in
     // route profile while the backend and logger are both still alive.
     sess->print_moe_route_profile();
+    sess->print_expert_copy_cache_stats();
     // we just need to delete the backend here
     // the sessions are allocated & freed as part of the registry
     delete backend;
@@ -4806,6 +4931,18 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
 
     HEX_VERBOSE("ggml-hex: %s graph-compute n_nodes %d\n", sess->c_name(), graph->n_nodes);
 
+    // A DSP output can reuse an address that previously held a staged expert.
+    // Invalidate output ranges before execution; live weight inputs cannot
+    // overlap them under the graph allocator's lifetime rules.
+    if (opt_expert_copy_cache) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * output = graph->nodes[i];
+            if (output != nullptr && output->data != nullptr) {
+                sess->invalidate_expert_copy_cache(output->data, ggml_nbytes(output));
+            }
+        }
+    }
+
     // set_tensor_async() may have queued sparse expert copies.  The scheduler
     // calls graph_compute only after issuing all inputs for this split, so this
     // is the single completion fence before the DSP can consume them.
@@ -4926,7 +5063,10 @@ static void ggml_backend_hexagon_set_tensor_async(
 
     if (raw_q4_0_expert_copy) {
         GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
-        sess->enqueue_host_copy((char *) tensor->data + offset, data, size);
+        void * destination = (char *) tensor->data + offset;
+        if (!sess->expert_copy_cache_hit(destination, data, size)) {
+            sess->enqueue_host_copy(destination, data, size);
+        }
         return;
     }
 
@@ -5654,6 +5794,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_mmid_raw_q4_0 = getenv("GGML_HEXAGON_MMID_RAW_Q4_0");
     const char * str_host_copy_threads = getenv("GGML_HEXAGON_HOST_COPY_THREADS");
     const char * str_route_profile = getenv("GGML_HEXAGON_ROUTE_PROFILE");
+    const char * str_expert_copy_cache = getenv("GGML_HEXAGON_EXPERT_COPY_CACHE");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -5690,6 +5831,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mmid_raw_q4_0 = str_mmid_raw_q4_0 ? atoi(str_mmid_raw_q4_0) : opt_mmid_raw_q4_0;
     opt_host_copy_threads = str_host_copy_threads ? strtoul(str_host_copy_threads, NULL, 0) : opt_host_copy_threads;
     opt_route_profile = str_route_profile ? atoi(str_route_profile) : opt_route_profile;
+    opt_expert_copy_cache = str_expert_copy_cache ? atoi(str_expert_copy_cache) : opt_expert_copy_cache;
     opt_opstage   = str_opstage  ? strtoul(str_opstage, NULL, 0)          : opt_opstage;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
