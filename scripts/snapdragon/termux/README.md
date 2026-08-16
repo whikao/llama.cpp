@@ -104,6 +104,8 @@ The main environment variables are:
 | `TRACE_START` | `blk.0.ffn_gate_exps` | Hexagon trace start tensor |
 | `TRACE_COUNT` | `8` | Trace checkpoint count |
 | `DEBUG_K` | `192` | Hexagon debug K value |
+| `MMID_DEBUG` | `1` | Enable the MMID runtime diagnostic controls |
+| `MMID_QUANT_MODE` | `auto` | Activation quantizer: `auto`, `block`, or `row` |
 | `LOG_ROOT` | `/sdcard/htp-debug` | Shared log directory |
 | `APP_ROOT` | `$HOME/.local/share/llama-phone-debug` | Versioned installation root |
 
@@ -115,10 +117,28 @@ GGML_HEXAGON_NDEV=4
 GGML_HEXAGON_MMID_RAW_Q4_0=1
 GGML_HEXAGON_HOSTBUF=1
 GGML_HEXAGON_VERBOSE=1
+GGML_HEXAGON_MMID_DEBUG=1
+GGML_HEXAGON_MMID_QUANT_MODE=auto
 GGML_HEXAGON_DEBUG_K=192
 GGML_HEXAGON_TRACE_START=blk.0.ffn_gate_exps
 GGML_HEXAGON_TRACE_COUNT=8
 ```
+
+The v10.21 diagnostic build can switch the MMID activation quantizer without
+another GitHub Actions build. For a focused A/B run, use one of:
+
+```bash
+MMID_QUANT_MODE=block "$HOME/phone-debug.sh" run htp
+MMID_QUANT_MODE=row "$HOME/phone-debug.sh" run htp
+```
+
+`auto` keeps the normal selection rule. `block` and `row` only affect the
+experimental raw-Q4_0 `MUL_MAT_ID` path while the debug-control packet is
+enabled.
+
+The helper also passes `--single-turn`. Chat models can automatically enable conversation mode; single-turn mode exits after the predefined prompt instead of waiting at the `>` prompt. The live raw log path is printed before each command starts.
+
+Before launching `llama-cli`, the helper changes its working directory to the installed `lib` directory. llama.cpp discovers dynamic backend plug-ins in the executable directory and current working directory; `LD_LIBRARY_PATH` alone resolves shared-library dependencies but does not add a backend discovery directory. This is required because `llama-cli` is installed in `bin` while `libggml-hexagon.so` is installed in `lib`.
 
 ## Results
 
@@ -127,6 +147,8 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
 - `cpu.log` and `htp.log`: full command output.
 - `debug-trace.log`: extracted `DBG_*` and `MUL_MAT_ID` lines.
 - `mmid-summary.tsv`: counts for the `DBG_V120_MMID_SLICE` checkpoints, including finite source slices that produced nonfinite destination slices.
+- `DBG_V121_MMID_*` lines in the raw/debug trace: per-slice quantizer mode,
+  source/Q8 fingerprints, expert/Q4 offsets and fingerprints, and exact dot outputs.
 - `summary.md`: exit codes, the MMID table, build identity, phone identity, and active debug settings.
 - `share-this.tar.gz`: the small bundle to attach to the debugging chat.
 

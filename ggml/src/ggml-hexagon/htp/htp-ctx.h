@@ -67,6 +67,12 @@ struct htp_ops_context {
 
     uint32_t n_threads;
     uint32_t flags;
+
+    // v10.21: process_opbatch() lends the targeted V120 record array to the
+    // raw-Q4_0 MMID worker so it can enrich each slice with exact internal
+    // offsets and fingerprints.  The worker claims one record per rm2 slice.
+    struct htp_mmid_slice_trace_record * dbg_mmid_slice_trace;
+    volatile uint32_t                    dbg_mmid_slice_claimed;
 };
 
 // Main context for htp DSP backend

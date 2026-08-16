@@ -116,6 +116,10 @@ struct htp_mm_context {
     uint32_t dbg_v112_want_cid;
     uint32_t dbg_v112_want_k;
 
+    // v10.21: actual activation-quantization implementation selected for
+    // this MMID invocation (block or row), including an optional forced A/B.
+    uint32_t dbg_v121_quant_mode;
+
     // v10.14.1: exact row-0 integer accumulator from accum_4bit_32x1().
     int32_t dbg_v114_hvx_int_dot;
 
@@ -1219,6 +1223,23 @@ static inline uint8_t htp_raw_q4_0_get_nibble(const uint8_t * qs, uint32_t q) {
     return qs[q - 16] >> 4;
 }
 
+static inline uint32_t htp_dbg_v121_fnv1a(
+        const uint8_t * data, size_t n) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static inline uint32_t htp_dbg_v121_load_u32(
+        const uint8_t * data, size_t available) {
+    uint32_t value = 0;
+    memcpy(&value, data, MIN(available, sizeof(value)));
+    return value;
+}
+
 _Static_assert(HTP_MM_WEIGHT_TILE_SIZE_Q4_0 == 576, "unexpected Q4_0 logical tile size");
 _Static_assert(HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 == 640, "unexpected Q4_0 aligned tile stride");
 
@@ -1441,6 +1462,147 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                     src1_data + (ir1 + rm2 * ne11) * src1_stride;
                 float * restrict dst_row =
                     (float *) (dst->data + (rm1 * nb1 + rm2 * nb2));
+
+                // v10.21: claim exactly one real dot invocation per rm2 slice.
+                // This record joins the outer V120 pre/post snapshot, allowing
+                // the host to determine whether corruption first appears in
+                // source addressing, Q8 quantization, expert/Q4 staging, or the
+                // dot output.  The target ct comes from the existing runtime
+                // debug control and defaults to row tile zero.
+                struct htp_mmid_slice_trace_record * dbg_v121_rec = NULL;
+                const uint32_t dbg_v121_target_ct =
+                    mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_ct : 0u;
+                if (octx->dbg_mmid_slice_trace &&
+                    ct == dbg_v121_target_ct &&
+                    rm2 >= 0 && (uint32_t) rm2 < HTP_MMID_SLICE_TRACE_MAX) {
+                    const uint32_t bit = 1u << (uint32_t) rm2;
+                    const uint32_t old = __sync_fetch_and_or(
+                        &octx->dbg_mmid_slice_claimed, bit);
+                    if ((old & bit) == 0) {
+                        dbg_v121_rec =
+                            &octx->dbg_mmid_slice_trace[(uint32_t) rm2];
+
+                        const uint32_t q8_row = ir1 + (uint32_t) rm2 * ne11;
+                        const uint32_t src1_z2 = ne12 > 0 ?
+                            (uint32_t) rm2 % ne12 : 0u;
+                        const uint32_t src1_z3 = ne12 > 0 ?
+                            (uint32_t) rm2 / ne12 : 0u;
+                        const uint8_t * src1_orig =
+                            (const uint8_t *) src1->data +
+                            (size_t) ir1 * nb11 +
+                            (size_t) src1_z2 * nb12 +
+                            (size_t) src1_z3 * nb13;
+                        const uint8_t * src1_quant =
+                            (const uint8_t *) src1->data +
+                            (size_t) q8_row * nb11;
+                        const size_t src1_span = ne10 == 0 ? 0 :
+                            (size_t) (ne10 - 1u) * nb10 + sizeof(float);
+                        const size_t q8_bytes = src1_stride;
+                        const size_t raw_bytes =
+                            (size_t) valid_rows * raw_row_size;
+                        const size_t tiled_bytes =
+                            (size_t) (ne00 / 32u) *
+                            HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
+                        const uint8_t * vtcm_base =
+                            (const uint8_t *) octx->ctx->vtcm_base;
+
+                        dbg_v121_rec->quant_mode =
+                            mmctx->dbg_v121_quant_mode;
+                        dbg_v121_rec->n_threads = octx->n_threads;
+                        dbg_v121_rec->n_quant_tasks =
+                            mmctx->n_quant_tasks;
+                        dbg_v121_rec->src1_nrows = mmctx->src1_nrows;
+                        dbg_v121_rec->quant_rows_per_thread =
+                            mmctx->n_quant_rows_per_thread;
+
+                        dbg_v121_rec->expert = cur_a;
+                        dbg_v121_rec->cid = cid;
+                        dbg_v121_rec->ct = ct;
+                        dbg_v121_rec->ith = ith;
+                        dbg_v121_rec->rm1 = (uint32_t) rm1;
+                        dbg_v121_rec->rm2 = (uint32_t) rm2;
+                        dbg_v121_rec->ir1 = ir1;
+                        dbg_v121_rec->q8_row = q8_row;
+                        dbg_v121_rec->valid_rows = valid_rows;
+                        dbg_v121_rec->mapping_stride =
+                            mmctx->mapping_stride;
+                        dbg_v121_rec->expert_mapping_count =
+                            (uint32_t) cne1;
+
+                        dbg_v121_rec->src_orig_off =
+                            (uint32_t) (src1_orig -
+                                (const uint8_t *) src1->data);
+                        dbg_v121_rec->src_orig_hash_bytes =
+                            (uint32_t) src1_span;
+                        dbg_v121_rec->src_orig_hash =
+                            htp_dbg_v121_fnv1a(src1_orig, src1_span);
+                        dbg_v121_rec->src_quant_off =
+                            (uint32_t) (src1_quant -
+                                (const uint8_t *) src1->data);
+                        dbg_v121_rec->src_quant_hash =
+                            htp_dbg_v121_fnv1a(src1_quant, src1_span);
+                        dbg_v121_rec->src_orig_word0 =
+                            htp_dbg_v121_load_u32(src1_orig, src1_span);
+                        dbg_v121_rec->src_orig_word1 = src1_span > 4 ?
+                            htp_dbg_v121_load_u32(src1_orig + 4, src1_span - 4) : 0;
+                        dbg_v121_rec->src_orig_word2 = src1_span > 8 ?
+                            htp_dbg_v121_load_u32(src1_orig + 8, src1_span - 8) : 0;
+                        dbg_v121_rec->src_orig_word3 = src1_span > 12 ?
+                            htp_dbg_v121_load_u32(src1_orig + 12, src1_span - 12) : 0;
+
+                        dbg_v121_rec->q8_vtcm_off =
+                            (uint32_t) (src1_col - vtcm_base);
+                        dbg_v121_rec->q8_stride = (uint32_t) src1_stride;
+                        dbg_v121_rec->q8_hash_bytes = (uint32_t) q8_bytes;
+                        dbg_v121_rec->q8_hash =
+                            htp_dbg_v121_fnv1a(src1_col, q8_bytes);
+                        dbg_v121_rec->q8_word0 =
+                            htp_dbg_v121_load_u32(src1_col, q8_bytes);
+                        dbg_v121_rec->q8_word1 = q8_bytes > 4 ?
+                            htp_dbg_v121_load_u32(src1_col + 4, q8_bytes - 4) : 0;
+                        dbg_v121_rec->q8_word2 = q8_bytes > 8 ?
+                            htp_dbg_v121_load_u32(src1_col + 8, q8_bytes - 8) : 0;
+                        dbg_v121_rec->q8_word3 = q8_bytes > 12 ?
+                            htp_dbg_v121_load_u32(src1_col + 12, q8_bytes - 12) : 0;
+                        dbg_v121_rec->q8_scale0 = q8_bytes > 1024 ?
+                            htp_dbg_v121_load_u32(
+                                src1_col + 1024, q8_bytes - 1024) : 0;
+                        dbg_v121_rec->q8_scale1 = q8_bytes > 1028 ?
+                            htp_dbg_v121_load_u32(
+                                src1_col + 1028, q8_bytes - 1028) : 0;
+
+                        dbg_v121_rec->q4_model_off =
+                            (uint32_t) ((src0_expert +
+                                (size_t) ct * 32u * raw_row_size) -
+                                (const uint8_t *) src0->data);
+                        dbg_v121_rec->q4_raw_vtcm_off =
+                            (uint32_t) (raw_buf - vtcm_base);
+                        dbg_v121_rec->q4_raw_hash_bytes =
+                            (uint32_t) raw_bytes;
+                        dbg_v121_rec->q4_raw_hash =
+                            htp_dbg_v121_fnv1a(raw_buf, raw_bytes);
+                        dbg_v121_rec->q4_raw_word0 =
+                            htp_dbg_v121_load_u32(raw_buf, raw_bytes);
+                        dbg_v121_rec->q4_raw_scale0 =
+                            htp_dbg_v121_load_u32(raw_buf, MIN(raw_bytes, 2u));
+
+                        dbg_v121_rec->q4_tiled_vtcm_off =
+                            (uint32_t) (tiled_buf - vtcm_base);
+                        dbg_v121_rec->q4_tiled_hash_bytes =
+                            (uint32_t) tiled_bytes;
+                        dbg_v121_rec->q4_tiled_hash =
+                            htp_dbg_v121_fnv1a(tiled_buf, tiled_bytes);
+                        dbg_v121_rec->q4_tiled_word0 =
+                            htp_dbg_v121_load_u32(tiled_buf, tiled_bytes);
+                        dbg_v121_rec->q4_tiled_scale0 = tiled_bytes > 512 ?
+                            htp_dbg_v121_load_u32(
+                                tiled_buf + 512, tiled_bytes - 512) : 0;
+
+                        dbg_v121_rec->dst_off =
+                            (uint32_t) ((uint8_t *) dst_row -
+                                (uint8_t *) dst->data);
+                    }
+                }
 
                 if (ct == (mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_ct : 0u) &&
                     cid == (mmctx->dbg_v112_enabled ? mmctx->dbg_v112_want_cid : 0u) &&
@@ -1824,6 +1986,28 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
 
                 tiled_vec_dot_q4_0_32x1(
                     ne10, &dst_row[ct * 32], tiled_buf, src1_col, valid_rows, NULL);
+
+                if (dbg_v121_rec) {
+                    const uint32_t out_base = ct * 32u;
+                    if (valid_rows > 0) {
+                        memcpy(&dbg_v121_rec->dot_out0,
+                            &dst_row[out_base + 0], sizeof(uint32_t));
+                    }
+                    if (valid_rows > 1) {
+                        memcpy(&dbg_v121_rec->dot_out1,
+                            &dst_row[out_base + 1], sizeof(uint32_t));
+                    }
+                    if (valid_rows > 2) {
+                        memcpy(&dbg_v121_rec->dot_out2,
+                            &dst_row[out_base + 2], sizeof(uint32_t));
+                    }
+                    if (valid_rows > 3) {
+                        memcpy(&dbg_v121_rec->dot_out3,
+                            &dst_row[out_base + 3], sizeof(uint32_t));
+                    }
+                    __sync_synchronize();
+                    dbg_v121_rec->internal_valid = 1;
+                }
 
                 // v10.8.1: this is the real raw-Q4_0 MMID dot scope.
                 // Capture only cid=0 / ct=0 so it corresponds to the same
@@ -4228,7 +4412,21 @@ static int hvx_mm_matmul_id(
 
     work_queue_func_t quant_task_func;
     uint32_t n_quant_tasks = 1;
-    if (src1_nrows < octx->n_threads) {
+
+    uint32_t dbg_flags = 0;
+    if ((uint32_t) octx->kernel_params[HTP_MM_DEBUG_CTRL_WORD_MAGIC] ==
+        HTP_MM_DEBUG_CTRL_MAGIC) {
+        dbg_flags = (uint32_t) octx->kernel_params[HTP_MM_DEBUG_CTRL_WORD_FLAGS];
+    }
+    const bool force_quant_block =
+        (dbg_flags & HTP_MM_DEBUG_FLAG_FORCE_QUANT_BLOCK) != 0;
+    const bool force_quant_row =
+        (dbg_flags & HTP_MM_DEBUG_FLAG_FORCE_QUANT_ROW) != 0;
+    const bool use_quant_block = force_quant_block ||
+        (!force_quant_row && src1_nrows < octx->n_threads);
+
+    if (use_quant_block) {
+        mmctx->dbg_v121_quant_mode = HTP_MMID_QUANT_BLOCK;
         n_quant_tasks = MIN(total_nb, octx->n_threads);
         quant_task_func = (src0->type == HTP_TYPE_Q4_1) ? quantize_f32_q8_1_tiled_block : quantize_f32_q8_0_tiled_block;
         for (uint32_t ith = 0; ith < n_quant_tasks; ++ith) {
@@ -4240,6 +4438,7 @@ static int hvx_mm_matmul_id(
             mmctx->quant_c[ith]        = ib_first % nb;
         }
     } else {
+        mmctx->dbg_v121_quant_mode = HTP_MMID_QUANT_ROW;
         n_quant_tasks = MIN(src1_nrows, octx->n_threads);
         quant_task_func = (src0->type == HTP_TYPE_Q4_1) ? quantize_f32_q8_1_tiled : quantize_f32_q8_0_tiled;
     }

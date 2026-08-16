@@ -119,6 +119,19 @@ enum htp_op_code {
 #define HTP_MM_DEBUG_CTRL_WORD_K       36
 #define HTP_MM_DEBUG_CTRL_WORD_FLAGS   37
 
+// Runtime MMID diagnostic flags.  Bit 0 preserves the original v10.12
+// enable marker; bits 1/2 select one activation-quantization implementation
+// for an A/B run without requiring another rebuild.
+#define HTP_MM_DEBUG_FLAG_ENABLED           (1u << 0)
+#define HTP_MM_DEBUG_FLAG_FORCE_QUANT_BLOCK (1u << 1)
+#define HTP_MM_DEBUG_FLAG_FORCE_QUANT_ROW   (1u << 2)
+
+enum htp_mmid_quant_mode {
+    HTP_MMID_QUANT_AUTO  = 0,
+    HTP_MMID_QUANT_BLOCK = 1,
+    HTP_MMID_QUANT_ROW   = 2,
+};
+
 // v10.19 generic post-op trace controls.
 // Host marks a target op and the following N ops; DSP snapshots dst0 after each.
 #define HTP_POSTOP_TRACE_MAGIC          0x54523139u /* "TR19" */
@@ -281,6 +294,58 @@ struct htp_mmid_slice_trace_record {
     uint32_t dst_hash, dst_hash_bytes;
     uint32_t dst_word0, dst_word1, dst_word2, dst_word3;
     uint32_t dst_nonfinite, dst_maxabs_bits;
+
+    // v10.21: values captured inside the raw-Q4_0 MMID worker at the exact
+    // first dot call selected for this slice.  All pointer values are offsets
+    // from a stable tensor/VTCM base, never process-specific absolute values.
+    uint32_t internal_valid;
+    uint32_t quant_mode;
+    uint32_t n_threads;
+    uint32_t n_quant_tasks;
+    uint32_t src1_nrows;
+    uint32_t quant_rows_per_thread;
+
+    uint32_t expert;
+    uint32_t cid;
+    uint32_t ct;
+    uint32_t ith;
+    uint32_t rm1;
+    uint32_t rm2;
+    uint32_t ir1;
+    uint32_t q8_row;
+    uint32_t valid_rows;
+    uint32_t mapping_stride;
+    uint32_t expert_mapping_count;
+
+    uint32_t src_orig_off;
+    uint32_t src_orig_hash;
+    uint32_t src_orig_hash_bytes;
+    uint32_t src_quant_off;
+    uint32_t src_quant_hash;
+    uint32_t src_orig_word0, src_orig_word1, src_orig_word2, src_orig_word3;
+
+    uint32_t q8_vtcm_off;
+    uint32_t q8_stride;
+    uint32_t q8_hash;
+    uint32_t q8_hash_bytes;
+    uint32_t q8_word0, q8_word1, q8_word2, q8_word3;
+    uint32_t q8_scale0, q8_scale1;
+
+    uint32_t q4_model_off;
+    uint32_t q4_raw_vtcm_off;
+    uint32_t q4_raw_hash;
+    uint32_t q4_raw_hash_bytes;
+    uint32_t q4_raw_word0;
+    uint32_t q4_raw_scale0;
+
+    uint32_t q4_tiled_vtcm_off;
+    uint32_t q4_tiled_hash;
+    uint32_t q4_tiled_hash_bytes;
+    uint32_t q4_tiled_word0;
+    uint32_t q4_tiled_scale0;
+
+    uint32_t dst_off;
+    uint32_t dot_out0, dot_out1, dot_out2, dot_out3;
 };
 
 struct htp_opbatch_rsp {

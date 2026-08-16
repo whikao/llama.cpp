@@ -83,6 +83,7 @@ struct ggml_hexagon_mmid_debug_cfg {
     int32_t ct = 0;
     int32_t cid = 0;
     int32_t k = 32;
+    int32_t quant_mode = HTP_MMID_QUANT_AUTO;
     std::string tensor_substr;
 };
 
@@ -91,6 +92,21 @@ static const ggml_hexagon_mmid_debug_cfg & ggml_hexagon_mmid_debug_cfg_get() {
         ggml_hexagon_mmid_debug_cfg c;
         const char * e = std::getenv("GGML_HEXAGON_MMID_DEBUG");
         c.enabled = e && std::strcmp(e, "0") != 0 && e[0] != '\0';
+
+        // v10.21: optional one-build A/B selector.  Selecting block or row
+        // implicitly enables the debug-control packet even when the older
+        // GGML_HEXAGON_MMID_DEBUG variable is absent.
+        const char * q = std::getenv("GGML_HEXAGON_MMID_QUANT_MODE");
+        if (q && (!std::strcmp(q, "block") || !std::strcmp(q, "1"))) {
+            c.quant_mode = HTP_MMID_QUANT_BLOCK;
+            c.enabled = true;
+        } else if (q && (!std::strcmp(q, "row") || !std::strcmp(q, "2"))) {
+            c.quant_mode = HTP_MMID_QUANT_ROW;
+            c.enabled = true;
+        } else if (q && (!std::strcmp(q, "auto") || !std::strcmp(q, "0"))) {
+            c.quant_mode = HTP_MMID_QUANT_AUTO;
+        }
+
         if (!c.enabled) {
             return c;
         }
@@ -141,10 +157,18 @@ static void ggml_hexagon_apply_mmid_debug_ctrl(htp_opnode & node) {
     node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_CT]     = cfg.ct;
     node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_CID]    = cfg.cid;
     node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_K]      = cfg.k;
-    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_FLAGS]  = 1;
+    uint32_t flags = HTP_MM_DEBUG_FLAG_ENABLED;
+    if (cfg.quant_mode == HTP_MMID_QUANT_BLOCK) {
+        flags |= HTP_MM_DEBUG_FLAG_FORCE_QUANT_BLOCK;
+    } else if (cfg.quant_mode == HTP_MMID_QUANT_ROW) {
+        flags |= HTP_MM_DEBUG_FLAG_FORCE_QUANT_ROW;
+    }
+    node.kernel_params[HTP_MM_DEBUG_CTRL_WORD_FLAGS] = (int32_t) flags;
 
-    GGML_LOG_INFO("DBG_V112_CONFIG: tensor=%s expert=%d ct=%d cid=%d k=%d\n",
-        name ? name : "<null>", cfg.expert, cfg.ct, cfg.cid, cfg.k);
+    const char * quant_mode = cfg.quant_mode == HTP_MMID_QUANT_BLOCK ? "block" :
+                              cfg.quant_mode == HTP_MMID_QUANT_ROW   ? "row" : "auto";
+    GGML_LOG_INFO("DBG_V121_CONFIG: tensor=%s expert=%d ct=%d cid=%d k=%d quant=%s\n",
+        name ? name : "<null>", cfg.expert, cfg.ct, cfg.cid, cfg.k, quant_mode);
 }
 
 struct ggml_hexagon_postop_trace_cfg {
@@ -1875,6 +1899,67 @@ struct ggml_hexagon_opqueue {
                     r.dst_nb0,r.dst_nb1,r.dst_nb2,r.dst_nb3,
                     r.dst_hash,r.dst_nonfinite,dm.f,
                     d0.f,d1.f,d2.f,d3.f);
+
+                if (r.internal_valid) {
+                    const char * qmode =
+                        r.quant_mode == HTP_MMID_QUANT_BLOCK ? "block" :
+                        r.quant_mode == HTP_MMID_QUANT_ROW   ? "row" : "auto";
+                    union { uint32_t u; float f; } so0,so1,so2,so3,oo0,oo1,oo2,oo3;
+                    so0.u=r.src_orig_word0; so1.u=r.src_orig_word1;
+                    so2.u=r.src_orig_word2; so3.u=r.src_orig_word3;
+                    oo0.u=r.dot_out0; oo1.u=r.dot_out1;
+                    oo2.u=r.dot_out2; oo3.u=r.dot_out3;
+
+                    GGML_LOG_INFO(
+                        "DBG_V121_MMID_MAP: dev=%s batch=%u slice=%u "
+                        "quant=%s nth=%u qtasks=%u qrows=%u src_rows=%u "
+                        "expert=%u cid=%u cne1=%u map_stride=%u "
+                        "ct=%u ith=%u rm1=%u rm2=%u ir1=%u q8_row=%u valid_rows=%u "
+                        "src_logical_off=%u src_quant_off=%u "
+                        "q8_vtcm_off=%u q8_stride=%u "
+                        "q4_model_off=%u q4_raw_vtcm_off=%u q4_tiled_vtcm_off=%u "
+                        "dst_off=%u\n",
+                        shm_buf->sess->c_name(), rsp.id, r.slice,
+                        qmode, r.n_threads, r.n_quant_tasks,
+                        r.quant_rows_per_thread, r.src1_nrows,
+                        r.expert, r.cid, r.expert_mapping_count,
+                        r.mapping_stride, r.ct, r.ith,
+                        r.rm1, r.rm2, r.ir1, r.q8_row, r.valid_rows,
+                        r.src_orig_off, r.src_quant_off,
+                        r.q8_vtcm_off, r.q8_stride,
+                        r.q4_model_off, r.q4_raw_vtcm_off,
+                        r.q4_tiled_vtcm_off, r.dst_off);
+
+                    GGML_LOG_INFO(
+                        "DBG_V121_MMID_Q8: dev=%s batch=%u slice=%u "
+                        "src_bytes=%u src_fnv=%08x src_quant_fnv=%08x "
+                        "src_bits=%08x,%08x,%08x,%08x "
+                        "src_f32=%g,%g,%g,%g "
+                        "q8_bytes=%u q8_fnv=%08x q8_head=%08x,%08x,%08x,%08x "
+                        "q8_scales=%08x,%08x\n",
+                        shm_buf->sess->c_name(), rsp.id, r.slice,
+                        r.src_orig_hash_bytes, r.src_orig_hash,
+                        r.src_quant_hash,
+                        r.src_orig_word0, r.src_orig_word1,
+                        r.src_orig_word2, r.src_orig_word3,
+                        so0.f, so1.f, so2.f, so3.f,
+                        r.q8_hash_bytes, r.q8_hash,
+                        r.q8_word0, r.q8_word1, r.q8_word2, r.q8_word3,
+                        r.q8_scale0, r.q8_scale1);
+
+                    GGML_LOG_INFO(
+                        "DBG_V121_MMID_Q4_DOT: dev=%s batch=%u slice=%u "
+                        "raw_bytes=%u raw_fnv=%08x raw_head=%08x raw_scale=%08x "
+                        "tiled_bytes=%u tiled_fnv=%08x tiled_head=%08x tiled_scale=%08x "
+                        "out_bits=%08x,%08x,%08x,%08x out_f32=%g,%g,%g,%g\n",
+                        shm_buf->sess->c_name(), rsp.id, r.slice,
+                        r.q4_raw_hash_bytes, r.q4_raw_hash,
+                        r.q4_raw_word0, r.q4_raw_scale0,
+                        r.q4_tiled_hash_bytes, r.q4_tiled_hash,
+                        r.q4_tiled_word0, r.q4_tiled_scale0,
+                        r.dot_out0, r.dot_out1, r.dot_out2, r.dot_out3,
+                        oo0.f, oo1.f, oo2.f, oo3.f);
+                }
             }
         }
 

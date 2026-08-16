@@ -1292,9 +1292,18 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
             dbg_v120_capture_mmid_slices(
                 dbg_mmid_slice, &dbg_mmid_slice_count,
                 &ops[i], tens, false);
+
+            // v10.21: expose these already-allocated per-slice records only
+            // for the marked MMID op.  The worker enriches them in place and
+            // worker_pool_run_func() joins before this function continues.
+            octx->dbg_mmid_slice_trace = dbg_mmid_slice;
+            octx->dbg_mmid_slice_claimed = 0;
         }
 
         op_status = proc_op_req(octx, tens, i, &ops[i]);
+
+        // Never leave a stack-backed trace pointer armed for a later op.
+        octx->dbg_mmid_slice_trace = NULL;
 
         if (dbg_v120_target && op_status == HTP_STATUS_OK) {
             dbg_v120_capture_mmid_slices(

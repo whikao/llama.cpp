@@ -22,6 +22,8 @@ HTP_NGL="${HTP_NGL:-}"
 TRACE_START="${TRACE_START:-blk.0.ffn_gate_exps}"
 TRACE_COUNT="${TRACE_COUNT:-8}"
 DEBUG_K="${DEBUG_K:-192}"
+MMID_DEBUG="${MMID_DEBUG:-1}"
+MMID_QUANT_MODE="${MMID_QUANT_MODE:-auto}"
 TERMUX_PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 TMP_BASE="${TMPDIR:-$TERMUX_PREFIX/tmp}"
 TEMP_DIR=""
@@ -50,7 +52,7 @@ Usage:
 
 The default command is "all". Configuration is supplied with environment
 variables. Common variables are MODEL, PROMPT, NDEV, DEVICES, CTX_SIZE,
-THREADS, TOKENS, TIMEOUT_SECS, HTP_NGL, LOG_ROOT, and APP_ROOT.
+THREADS, TOKENS, TIMEOUT_SECS, HTP_NGL, MMID_QUANT_MODE, LOG_ROOT, and APP_ROOT.
 EOF
 }
 
@@ -89,10 +91,15 @@ validate_config() {
     require_integer TIMEOUT_SECS "$TIMEOUT_SECS"
     require_integer TRACE_COUNT "$TRACE_COUNT"
     require_integer DEBUG_K "$DEBUG_K"
+    require_integer MMID_DEBUG "$MMID_DEBUG"
     ((NDEV >= 1 && NDEV <= 4)) || die "NDEV must be between 1 and 4"
     ((CTX_SIZE >= 1)) || die "CTX_SIZE must be at least 1"
     ((THREADS >= 1)) || die "THREADS must be at least 1"
     [[ -z "$HTP_NGL" || "$HTP_NGL" =~ ^[0-9]+$ ]] || die "HTP_NGL must be empty or a non-negative integer"
+    case "$MMID_QUANT_MODE" in
+        auto|block|row) ;;
+        *) die "MMID_QUANT_MODE must be auto, block, or row: $MMID_QUANT_MODE" ;;
+    esac
     if [[ -z "$DEVICES" ]]; then
         DEVICES="$(default_devices "$NDEV")"
     fi
@@ -262,6 +269,7 @@ write_metadata() {
         printf 'ctx_size=%s\n' "$CTX_SIZE"
         printf 'threads=%s\n' "$THREADS"
         printf 'tokens=%s\n' "$TOKENS"
+        printf 'backend_dir=%s\n' "$release/lib"
         printf 'uname=%s\n' "$(uname -a)"
         printf 'llama_cli_sha256=%s\n' "$(sha256sum "$release/bin/llama-cli" | awk '{print $1}')"
         if command -v getprop >/dev/null 2>&1; then
@@ -280,6 +288,8 @@ write_metadata() {
         printf 'GGML_HEXAGON_MMID_RAW_Q4_0=%s\n' "$GGML_HEXAGON_MMID_RAW_Q4_0"
         printf 'GGML_HEXAGON_HOSTBUF=%s\n' "$GGML_HEXAGON_HOSTBUF"
         printf 'GGML_HEXAGON_VERBOSE=%s\n' "$GGML_HEXAGON_VERBOSE"
+        printf 'GGML_HEXAGON_MMID_DEBUG=%s\n' "$GGML_HEXAGON_MMID_DEBUG"
+        printf 'GGML_HEXAGON_MMID_QUANT_MODE=%s\n' "$GGML_HEXAGON_MMID_QUANT_MODE"
         printf 'GGML_HEXAGON_DEBUG_K=%s\n' "$GGML_HEXAGON_DEBUG_K"
         printf 'GGML_HEXAGON_TRACE_START=%s\n' "$GGML_HEXAGON_TRACE_START"
         printf 'GGML_HEXAGON_TRACE_COUNT=%s\n' "$GGML_HEXAGON_TRACE_COUNT"
@@ -292,9 +302,12 @@ run_logged() {
     local rc
     shift 2
 
+    say "Live log: $log_path"
+
     {
         printf '=== %s ===\n' "$label"
         printf 'Started: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'Working directory: %s\n' "$PWD"
         printf 'Command:'
         printf ' %q' "$@"
         printf '\n\n'
@@ -445,6 +458,7 @@ run_suite() {
     local cpu_rc="not-run"
     local htp_rc="not-run"
     local cli
+    local backend_dir
     local -a common_args
     local -a htp_args
     shift
@@ -469,23 +483,31 @@ run_suite() {
     [[ -f "$MODEL" ]] || die "Model not found: $MODEL"
     release="$(current_release)"
     cli="$release/bin/llama-cli"
+    backend_dir="$release/lib"
+    [[ -f "$backend_dir/libggml-hexagon.so" ]] || die "Hexagon backend is missing from $backend_dir"
     run_id="$(date -u +%Y%m%d-%H%M%S)-${release##*/}"
     output_dir="$LOG_ROOT/$run_id"
     mkdir -p "$output_dir"
 
-    export LD_LIBRARY_PATH="/vendor/lib64:/vendor/lib:$release/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="$release/lib:/vendor/lib64:/vendor/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export ADSP_LIBRARY_PATH="$release/lib${ADSP_LIBRARY_PATH:+:$ADSP_LIBRARY_PATH}"
     export GGML_HEXAGON_ARCH="${GGML_HEXAGON_ARCH:-81}"
     export GGML_HEXAGON_NDEV="$NDEV"
     export GGML_HEXAGON_MMID_RAW_Q4_0="${GGML_HEXAGON_MMID_RAW_Q4_0:-1}"
     export GGML_HEXAGON_HOSTBUF="${GGML_HEXAGON_HOSTBUF:-1}"
     export GGML_HEXAGON_VERBOSE="${GGML_HEXAGON_VERBOSE:-1}"
+    export GGML_HEXAGON_MMID_DEBUG="$MMID_DEBUG"
+    export GGML_HEXAGON_MMID_QUANT_MODE="$MMID_QUANT_MODE"
     export GGML_HEXAGON_DEBUG_K="$DEBUG_K"
     export GGML_HEXAGON_TRACE_START="$TRACE_START"
     export GGML_HEXAGON_TRACE_COUNT="$TRACE_COUNT"
 
+    # Dynamic backend discovery searches the executable directory and the
+    # current directory. The installed backend plug-ins live in lib/, not bin/.
+    cd "$backend_dir"
+
     write_metadata "$output_dir/metadata.txt" "$release"
-    common_args=(-c "$CTX_SIZE" -t "$THREADS" -n "$TOKENS" -v -m "$MODEL" -p "$PROMPT")
+    common_args=(-c "$CTX_SIZE" -t "$THREADS" -n "$TOKENS" -v --single-turn -m "$MODEL" -p "$PROMPT")
 
     if [[ "$mode" == both || "$mode" == cpu ]]; then
         say "Running CPU baseline"

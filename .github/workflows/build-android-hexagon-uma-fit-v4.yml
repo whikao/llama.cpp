@@ -88,9 +88,11 @@ jobs:
                 "#!/data/data/com.termux/files/usr/bin/bash" \
                 "set -e" \
                 "BASE=\"\$(cd \"\$(dirname \"\$0\")/..\" && pwd)\"" \
-                "export LD_LIBRARY_PATH=\"/vendor/lib64:/vendor/lib:\$BASE/lib:\${LD_LIBRARY_PATH:-}\"" \
+                "export LD_LIBRARY_PATH=\"\$BASE/lib:/vendor/lib64:/vendor/lib:\${LD_LIBRARY_PATH:-}\"" \
+                "export ADSP_LIBRARY_PATH=\"\$BASE/lib:\${ADSP_LIBRARY_PATH:-}\"" \
                 "export GGML_HEXAGON_ARCH=\"\${GGML_HEXAGON_ARCH:-81}\"" \
                 "export GGML_HEXAGON_NDEV=\"\${GGML_HEXAGON_NDEV:-1}\"" \
+                "cd \"\$BASE/lib\"" \
                 "exec \"\$BASE/bin/llama-cli\" \"\$@\"" \
                 > pkg-snapdragon/llama.cpp/scripts/run-termux.sh
               chmod +x pkg-snapdragon/llama.cpp/scripts/run-termux.sh
