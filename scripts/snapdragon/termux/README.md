@@ -99,12 +99,13 @@ The main environment variables are:
 | `CTX_SIZE` | `64` | Context size |
 | `THREADS` | `4` | CPU thread count |
 | `TOKENS` | `1` | Tokens to generate |
-| `TIMEOUT_SECS` | `1800` | Per-run timeout; use `0` to disable |
+| `TIMEOUT_SECS` | `0` | Per-run timeout; disabled by default to match direct Termux execution |
 | `HTP_NGL` | Empty | Optional explicit HTP layer count |
+| `NHMX` | `1` | Enable HMX; use `0` for an HVX-only diagnostic run |
 | `TRACE_START` | `blk.0.ffn_gate_exps` | Hexagon trace start tensor |
 | `TRACE_COUNT` | `8` | Trace checkpoint count |
 | `DEBUG_K` | `192` | Hexagon debug K value |
-| `MMID_DEBUG` | `1` | Enable the MMID runtime diagnostic controls |
+| `MMID_DEBUG` | `0` | Enable the MMID runtime diagnostic controls |
 | `MMID_QUANT_MODE` | `auto` | Activation quantizer: `auto`, `block`, or `row` |
 | `LOG_ROOT` | `/sdcard/htp-debug` | Shared log directory |
 | `APP_ROOT` | `$HOME/.local/share/llama-phone-debug` | Versioned installation root |
@@ -114,10 +115,11 @@ The script sets the current debug environment automatically:
 ```text
 GGML_HEXAGON_ARCH=81
 GGML_HEXAGON_NDEV=4
+GGML_HEXAGON_NHMX=1
 GGML_HEXAGON_MMID_RAW_Q4_0=1
 GGML_HEXAGON_HOSTBUF=1
 GGML_HEXAGON_VERBOSE=1
-GGML_HEXAGON_MMID_DEBUG=1
+GGML_HEXAGON_MMID_DEBUG=0
 GGML_HEXAGON_MMID_QUANT_MODE=auto
 GGML_HEXAGON_DEBUG_K=192
 GGML_HEXAGON_TRACE_START=blk.0.ffn_gate_exps
@@ -136,7 +138,11 @@ MMID_QUANT_MODE=row "$HOME/phone-debug.sh" run htp
 experimental raw-Q4_0 `MUL_MAT_ID` path while the debug-control packet is
 enabled.
 
-The helper also passes `--single-turn`. Chat models can automatically enable conversation mode; single-turn mode exits after the predefined prompt instead of waiting at the `>` prompt. The live raw log path is printed before each command starts.
+The `ne2=10` case uses the HMX `MUL_MAT_ID` implementation, so the HVX
+`block`/`row` selector does not affect it. Set `NHMX=0` only when an HVX-only
+comparison is requested.
+
+The helper also passes `--single-turn`. Chat models can automatically enable conversation mode; single-turn mode exits after the predefined prompt instead of waiting at the `>` prompt. The live raw log path is printed before each command starts. `TIMEOUT_SECS=0` is the default because the direct Termux command is the known-good launch form; set a positive timeout explicitly only when needed.
 
 Before launching `llama-cli`, the helper changes its working directory to the installed `lib` directory. llama.cpp discovers dynamic backend plug-ins in the executable directory and current working directory; `LD_LIBRARY_PATH` alone resolves shared-library dependencies but does not add a backend discovery directory. This is required because `llama-cli` is installed in `bin` while `libggml-hexagon.so` is installed in `lib`.
 

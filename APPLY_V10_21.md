@@ -1,23 +1,31 @@
-# Hexagon MMID v10.21 phone overlay
+# Hexagon HMX MMID v10.22 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
+The apply-note filename is retained so extraction cleanly updates the tracked
+v10.21 note instead of leaving a second stale file.
 
 ## What changes
 
-- Adds `DBG_V121_MMID_MAP`, `DBG_V121_MMID_Q8`, and
-  `DBG_V121_MMID_Q4_DOT` records for each traced MMID slice.
-- Records the logical and actual quantizer source offsets, Q8 VTCM row,
-  selected expert/mapping, raw and tiled Q4 working sets, actual dot inputs,
-  and the first four dot outputs.
-- Adds `GGML_HEXAGON_MMID_QUANT_MODE=auto|block|row` so the row and block
-  activation quantizers can be compared without rebuilding.
-- Keeps the Termux backend-discovery and `--single-turn` fixes.
+- Fixes the HMX `MUL_MAT_ID` gathered/scattered row workers used by the
+  `ne2=10` prompt batch. Padded 32-row chunks were split between eight workers
+  even when an expert had only one or two valid rows. Unsigned subtraction
+  underflowed for later workers and overlapping padded writes consumed invalid
+  expert mappings.
+- Uses exactly one gathered/scattered call per HMX VTCM tile chunk, bounds the
+  work to the expert's valid row count, and guards every worker against a start
+  row beyond `cne1`.
+- Makes the Termux helper match the successful direct command: no timeout by
+  default, no 32-bit vendor path, no inherited ADSP path, and no global MMID
+  control packet unless requested.
+- Adds `NHMX=0|1` to the helper for an explicit HVX-only comparison.
+- Retains the v10.21 `DBG_V121_MMID_*` records and the HVX
+  `GGML_HEXAGON_MMID_QUANT_MODE=auto|block|row` diagnostic selector.
 
 ## Apply in Termux
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-mmid-v10.21.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-mmid-v10.22.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -34,20 +42,17 @@ install -m 700 \
 "$HOME/phone-debug.sh" install
 ```
 
-Run the most useful first A/B case (force the block quantizer even when
-`ne2=10`):
+Run the HMX regression case:
 
 ```bash
 termux-wake-lock
-PROMPT='你好。' MMID_QUANT_MODE=block \
-  "$HOME/phone-debug.sh" run htp
+PROMPT='你好。' "$HOME/phone-debug.sh" run htp
 ```
 
 The helper prints the exact `share-this.tar.gz` path at the end. Attach that
-small archive to the debugging chat. If a row-mode comparison is requested,
+small archive to the debugging chat. If an HVX-only comparison is requested,
 run:
 
 ```bash
-PROMPT='你好。' MMID_QUANT_MODE=row \
-  "$HOME/phone-debug.sh" run htp
+PROMPT='你好。' NHMX=0 "$HOME/phone-debug.sh" run htp
 ```

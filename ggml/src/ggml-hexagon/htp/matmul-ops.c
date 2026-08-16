@@ -3207,11 +3207,15 @@ typedef struct {
 static void transfer_activation_chunk_gathered_worker_fn(unsigned int n, unsigned int i, void *data) {
     activation_transfer_gathered_task_state_t *st = data;
     struct htp_thread_trace * tr = &st->traces[i];
-    int chunk_idx = i;
-    int chunk_size = st->n_chunks_per_task;
-    int vtcm_start_row = chunk_idx * chunk_size;
-    int start_row = st->start_row + vtcm_start_row;
-    int n_rows = hex_smin(st->cne1 - start_row, chunk_size);
+    const uint32_t chunk_idx = i;
+    const uint32_t chunk_size = st->n_chunks_per_task;
+    const uint32_t vtcm_start_row = chunk_idx * chunk_size;
+    const uint32_t start_row = st->start_row + vtcm_start_row;
+    if (start_row >= st->cne1) {
+        return;
+    }
+    const uint32_t n_rows = (uint32_t) hex_smin(
+        (size_t) (st->cne1 - start_row), (size_t) chunk_size);
     if (n_rows > 0) {
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, chunk_idx);
         transfer_activation_chunk_fp32_to_fp16_gathered(
@@ -3225,11 +3229,15 @@ static void transfer_activation_chunk_gathered_worker_fn(unsigned int n, unsigne
 static void transfer_activation_chunk_gathered_worker_flat_fn(unsigned int n, unsigned int i, void *data) {
     activation_transfer_gathered_task_state_t *st = data;
     struct htp_thread_trace * tr = &st->traces[i];
-    int chunk_idx = i;
-    int chunk_size = st->n_chunks_per_task;
-    int vtcm_start_row = chunk_idx * chunk_size;
-    int start_row = st->start_row + vtcm_start_row;
-    int n_rows = hex_smin(st->cne1 - start_row, chunk_size);
+    const uint32_t chunk_idx = i;
+    const uint32_t chunk_size = st->n_chunks_per_task;
+    const uint32_t vtcm_start_row = chunk_idx * chunk_size;
+    const uint32_t start_row = st->start_row + vtcm_start_row;
+    if (start_row >= st->cne1) {
+        return;
+    }
+    const uint32_t n_rows = (uint32_t) hex_smin(
+        (size_t) (st->cne1 - start_row), (size_t) chunk_size);
     if (n_rows > 0) {
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_A_PREP, chunk_idx);
         transfer_activation_chunk_fp32_to_fp16_gathered_flat(
@@ -3243,11 +3251,15 @@ static void transfer_activation_chunk_gathered_worker_flat_fn(unsigned int n, un
 static void transfer_output_chunk_scattered_worker_fn(unsigned int n, unsigned int i, void *data) {
     output_transfer_scattered_task_state_t *st = data;
     struct htp_thread_trace * tr = &st->traces[i];
-    int chunk_idx = i;
-    int chunk_size = st->n_chunks_per_task;
-    int vtcm_start_row = chunk_idx * chunk_size;
-    int start_row = st->start_row + vtcm_start_row;
-    int n_rows = hex_smin(st->cne1 - start_row, chunk_size);
+    const uint32_t chunk_idx = i;
+    const uint32_t chunk_size = st->n_chunks_per_task;
+    const uint32_t vtcm_start_row = chunk_idx * chunk_size;
+    const uint32_t start_row = st->start_row + vtcm_start_row;
+    if (start_row >= st->cne1) {
+        return;
+    }
+    const uint32_t n_rows = (uint32_t) hex_smin(
+        (size_t) (st->cne1 - start_row), (size_t) chunk_size);
     if (n_rows > 0) {
         htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_O_PROC, chunk_idx);
         transfer_output_chunk_fp16_to_fp32_scattered(
@@ -4037,18 +4049,18 @@ static void transfer_activation_chunk_gathered_threaded(
             int cne1,
             int n_threads,
             int k_valid) {
-    if (n_rows <= 0) return;
-    int chunks_per_thread = hmx_ceil_div(n_rows, n_threads);
-    chunks_per_thread = hex_align_up(chunks_per_thread, 2);
+    if (n_rows <= 0 || start_row < 0 || start_row >= cne1) return;
 
-    int actual_threads = hmx_ceil_div(n_rows, chunks_per_thread);
+    const uint32_t valid_rows = (uint32_t) hex_smin(
+        (size_t) n_rows, (size_t) (cne1 - start_row));
+    if (valid_rows == 0) return;
 
     activation_transfer_gathered_task_state_t state = {
         .dst               = dst,
         .src               = src,
-        .n_tasks           = actual_threads,
-        .n_tot_chunks      = n_rows,
-        .n_chunks_per_task = chunks_per_thread,
+        .n_tasks           = 1,
+        .n_tot_chunks      = valid_rows,
+        .n_chunks_per_task = valid_rows,
         .k_block           = k_block,
         .matrix_rows       = matrix_rows,
         .cur_a             = cur_a,
@@ -4066,11 +4078,13 @@ static void transfer_activation_chunk_gathered_threaded(
     worker_callback_t worker_fn = ne11 == 1 ? transfer_activation_chunk_gathered_worker_flat_fn :
                                               transfer_activation_chunk_gathered_worker_fn;
 
-    if (actual_threads <= 1) {
-        worker_fn(1, 0, &state);
-    } else {
-        worker_pool_run_func(ctx->worker_pool, worker_fn, &state, actual_threads);
-    }
+    // Each gathered helper pads its call to a complete 32-row HMX tile.  If a
+    // tile is split between workers, those padded writes overlap and workers
+    // whose start row is beyond cne1 underflow the remaining-row calculation.
+    // Keep one gather call per VTCM tile chunk; the inner conversion remains
+    // vectorized across K.
+    worker_fn(1, 0, &state);
+    (void) n_threads;
 }
 
 static void transfer_output_chunk_scattered_threaded(
@@ -4087,18 +4101,18 @@ static void transfer_output_chunk_scattered_threaded(
             size_t dst_nb2,
             int cne1,
             int n_threads) {
-    if (n_rows <= 0) return;
-    int chunks_per_thread = hmx_ceil_div(n_rows, n_threads);
-    chunks_per_thread = hex_align_up(chunks_per_thread, 2);
+    if (n_rows <= 0 || start_row < 0 || start_row >= cne1) return;
 
-    int actual_threads = hmx_ceil_div(n_rows, chunks_per_thread);
+    const uint32_t valid_rows = (uint32_t) hex_smin(
+        (size_t) n_rows, (size_t) (cne1 - start_row));
+    if (valid_rows == 0) return;
 
     output_transfer_scattered_task_state_t state = {
         .vtcm_src          = vtcm_src,
         .dst               = dst,
-        .n_tasks           = actual_threads,
-        .n_tot_chunks      = n_rows,
-        .n_chunks_per_task = chunks_per_thread,
+        .n_tasks           = 1,
+        .n_tot_chunks      = valid_rows,
+        .n_chunks_per_task = valid_rows,
         .n_cols            = n_cols,
         .matrix_rows       = matrix_rows,
         .cur_a             = cur_a,
@@ -4110,11 +4124,8 @@ static void transfer_output_chunk_scattered_threaded(
         .traces            = ctx->trace,
     };
 
-    if (actual_threads <= 1) {
-        transfer_output_chunk_scattered_worker_fn(1, 0, &state);
-    } else {
-        worker_pool_run_func(ctx->worker_pool, transfer_output_chunk_scattered_worker_fn, &state, actual_threads);
-    }
+    transfer_output_chunk_scattered_worker_fn(1, 0, &state);
+    (void) n_threads;
 }
 
 static int hmx_mm_id_2d_f32(struct htp_context *ctx,
