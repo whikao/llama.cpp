@@ -109,6 +109,7 @@ The main environment variables are:
 | `MMID_QUANT_MODE` | `auto` | Activation quantizer: `auto`, `block`, or `row` |
 | `LOG_ROOT` | `/sdcard/htp-debug` | Shared log directory |
 | `APP_ROOT` | `$HOME/.local/share/llama-phone-debug` | Versioned installation root |
+| `DOWNLOAD_CACHE` | `$APP_ROOT/downloads` | Persistent checksum-keyed package cache used for resumable downloads |
 
 The script sets the current debug environment automatically:
 
@@ -148,6 +149,14 @@ groups, using the output tile's scale/alignment area as temporary VTCM storage.
 It retains the v10.26 scalar transform for partial-row tiles and does not add a
 buffer or change the tiled byte equations.
 
+The first v10.27 phone run exposed a word-gather base-alignment issue: using
+`raw + 2` as Rt gathered the two scale bytes before the Q payload and changed
+the generated token despite all slices remaining finite. v10.28 keeps Rt at
+the aligned raw-chunk base and carries the Q/group displacement in the vector
+offsets. Do not use the v10.27 build identified by commit `2c47573` for model
+output; it is retained only as the diagnostic result that established the
+addressing correction.
+
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:
 
@@ -184,3 +193,10 @@ Each run creates a timestamped directory below `/sdcard/htp-debug` containing:
 - `share-this.tar.gz`: the small bundle to attach to the debugging chat.
 
 The checksum verifies that the package and the workflow checksum match. It protects against transfer errors and update races; it does not replace trust in the repository and GitHub Actions configuration.
+
+The v10.27.1 installer fetches `SHA256SUMS` before the large package and stores
+partial package data below `DOWNLOAD_CACHE`. Its cache filename includes the
+expected digest, so a newer rolling release cannot be confused with an older
+partial download. Network failures and `Ctrl+C` leave the partial package for
+the next `install` command to resume; the active release changes only after a
+complete checksum and archive validation.

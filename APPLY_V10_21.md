@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.27 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.28 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,20 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.28 fixes the v10.27 gather address observed on the phone. Passing
+  `raw + 2` as the word-gather base caused the target to round the base down
+  and gather Q4_0 scale bytes: the first packed byte became `0xd4` from scale
+  bytes `0x54,0x1d`, instead of reference `0x96` from Q bytes `0x06,0x89`.
+  The gather base now remains aligned at `raw`; the per-group Q offset is added
+  to every vector offset, where unaligned final element addresses are valid.
+- The rejected v10.27 result completed in 12.861 seconds but emitted a newline
+  token instead of `你好`. Finite-slice checks remained clean, demonstrating
+  why the token/reference checks are required in addition to NaN detection.
+- v10.27.1 makes phone installation resumable on unstable GitHub connections.
+  The helper downloads `SHA256SUMS` first, names a persistent private cache
+  entry by the expected digest, resumes the large asset with `curl -C -`, and
+  switches `current` only after the complete SHA256 and archive layout pass.
+  An interrupted download no longer disappears with the temporary directory.
 - v10.27 replaces the remaining full-tile strided scalar Q-byte reads with
   four word-granularity HVX gathers per 32-row K tile. Gather results use the
   tile's 128-byte scale/alignment area as temporary VTCM storage, so memory use
@@ -73,7 +87,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.27.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.28.tar.gz -C .
 git diff --check
 git status --short
 ```

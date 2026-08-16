@@ -9,6 +9,7 @@ ASSET="${ASSET:-llama.cpp-android-hexagon-uma-fit-v4.tar.gz}"
 APP_ROOT="${APP_ROOT:-$HOME/.local/share/llama-phone-debug}"
 RELEASES_DIR="$APP_ROOT/releases"
 CURRENT_LINK="$APP_ROOT/current"
+DOWNLOAD_CACHE="${DOWNLOAD_CACHE:-$APP_ROOT/downloads}"
 LOG_ROOT="${LOG_ROOT:-/sdcard/htp-debug}"
 MODEL="${MODEL:-/sdcard/gguf/Qwen3-30B-A3B-Instruct-2507-Q4_0.gguf}"
 PROMPT="${PROMPT:-Hello.}"
@@ -168,19 +169,16 @@ install_release() {
     require_command awk
     require_command mktemp
 
-    mkdir -p "$RELEASES_DIR" "$TMP_BASE"
+    mkdir -p "$RELEASES_DIR" "$DOWNLOAD_CACHE" "$TMP_BASE"
     TEMP_DIR="$(mktemp -d "$TMP_BASE/llama-phone-debug.XXXXXXXX")"
-    archive="$TEMP_DIR/$ASSET"
     checksum_file="$TEMP_DIR/SHA256SUMS"
     build_info="$TEMP_DIR/BUILD_INFO.txt"
 
     for attempt in 1 2 3; do
-        say "Downloading $ASSET (attempt $attempt/3)"
-        if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 30 "$base_url/$ASSET" -o "$archive"; then
-            warn "Package download failed"
-            continue
-        fi
-        if ! curl --fail --location --silent --show-error --retry 3 --connect-timeout 30 "$base_url/SHA256SUMS" -o "$checksum_file"; then
+        say "Downloading SHA256SUMS (attempt $attempt/3)"
+        if ! curl --fail --location --silent --show-error \
+            --retry 10 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+            "$base_url/SHA256SUMS" -o "$checksum_file"; then
             warn "Checksum download failed"
             continue
         fi
@@ -195,14 +193,39 @@ install_release() {
                 }
             }
         ' "$checksum_file")"
+
+        if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            warn "SHA256SUMS does not contain $ASSET"
+            continue
+        fi
+
+        archive="$DOWNLOAD_CACHE/${expected,,}-$ASSET"
+        if [[ -f "$archive" ]]; then
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+            if [[ "${actual,,}" == "${expected,,}" ]]; then
+                say "Using verified cached package $archive"
+                verified=1
+                break
+            fi
+        fi
+
+        say "Downloading $ASSET with resume support (attempt $attempt/3)"
+        if ! curl --fail --location --silent --show-error \
+            --retry 20 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+            --continue-at - "$base_url/$ASSET" -o "$archive"; then
+            warn "Package download interrupted; partial data kept for resume"
+            continue
+        fi
+
         actual="$(sha256sum "$archive" | awk '{print $1}')"
 
-        if [[ "$expected" =~ ^[0-9a-fA-F]{64}$ && "${actual,,}" == "${expected,,}" ]]; then
+        if [[ "${actual,,}" == "${expected,,}" ]]; then
             verified=1
             break
         fi
 
-        warn "Checksum mismatch. The rolling release may be updating; retrying"
+        warn "Checksum mismatch. Removing the invalid cached package before retrying"
+        rm -f -- "$archive"
         sleep 2
     done
 

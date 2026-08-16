@@ -1283,13 +1283,20 @@ static void htp_raw_q4_0_32rows_to_tiled(
 
             #pragma unroll(4)
             for (uint32_t group = 0; group < 4; ++group) {
-                const uint8_t * gather_base =
-                    raw + kt * HTP_RAW_Q4_0_BLOCK_BYTES + 2 + group * 4;
+                // Keep Rt word-aligned. On this target an unaligned Rt was
+                // rounded down, so raw+2 gathered the fp16 scale bytes and
+                // produced 0xd4 instead of the reference 0x96 for the first
+                // packed Q byte. The architecture permits unaligned final
+                // element addresses, so carry the Q offset in Vv instead.
+                const uint32_t group_offset =
+                    kt * HTP_RAW_Q4_0_BLOCK_BYTES + 2 + group * 4;
+                const HVX_Vector v_group_offsets = Q6_Vw_vadd_VwVw(
+                    v_raw_row_offsets, Q6_V_vsplat_R((int) group_offset));
                 Q6_vgather_ARMVw(
                     (HVX_Vector *) gather_words,
-                    (size_t) gather_base,
+                    (size_t) raw,
                     gather_region,
-                    v_raw_row_offsets);
+                    v_group_offsets);
 
                 const uint32_t qp = 2 * group;
                 for (uint32_t row = 0; row < 32; ++row) {
