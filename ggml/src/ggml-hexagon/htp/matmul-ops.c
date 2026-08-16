@@ -1223,28 +1223,10 @@ static inline uint8_t htp_raw_q4_0_get_nibble(const uint8_t * qs, uint32_t q) {
     return qs[q - 16] >> 4;
 }
 
-static inline uint8_t htp_raw_q4_0_pair_lo01(uint32_t pair) {
-    return (uint8_t) ((pair & 0x0000000f) | ((pair >> 4) & 0x000000f0));
-}
-
-static inline uint8_t htp_raw_q4_0_pair_hi01(uint32_t pair) {
-    return (uint8_t) (((pair >> 4) & 0x0000000f) | ((pair >> 8) & 0x000000f0));
-}
-
-static inline uint8_t htp_raw_q4_0_pair_lo23(uint32_t pair) {
-    return (uint8_t) (((pair >> 16) & 0x0000000f) | ((pair >> 20) & 0x000000f0));
-}
-
-static inline uint8_t htp_raw_q4_0_pair_hi23(uint32_t pair) {
-    return (uint8_t) (((pair >> 20) & 0x0000000f) | ((pair >> 24) & 0x000000f0));
-}
-
-static inline uint32_t htp_raw_q4_0_pack_4rows(
-        uint8_t row0, uint8_t row1, uint8_t row2, uint8_t row3) {
-    return (uint32_t) row0 |
-           ((uint32_t) row1 << 8) |
-           ((uint32_t) row2 << 16) |
-           ((uint32_t) row3 << 24);
+static inline HVX_Vector htp_raw_q4_0_compact_word_lsb(HVX_Vector v) {
+    // One byte deal keeps even bytes in the low half. Repeating it keeps byte
+    // 0 of each 32-bit word in the low 32 bytes, preserving row order.
+    return Q6_Vb_vdeal_Vb(Q6_Vb_vdeal_Vb(v));
 }
 
 static inline uint32_t htp_dbg_v121_fnv1a(
@@ -1322,36 +1304,37 @@ static void htp_raw_q4_0_32rows_to_tiled(
                     gather_region,
                     v_group_offsets);
 
-                // v10.29: retain the verified v10.28 gather and byte equations,
-                // but pack four result rows into each scalar store. This cuts
-                // the gather post-processing loop and store count by 4x without
-                // introducing a new HVX permutation or changing byte order.
+                // v10.30: keep the verified v10.28 gather and byte equations in
+                // HVX registers. Word shifts isolate the four packed outputs;
+                // two byte-deal operations compact word byte 0 for all 32 rows.
+                // v10.29's scalar four-row packing regressed on-device because
+                // its fully-unrolled dependency chains increased register and
+                // instruction pressure, so no scalar row loop remains here.
                 const uint32_t qp = 2 * group;
-                #pragma unroll(8)
-                for (uint32_t row = 0; row < 32; row += 4) {
-                    const uint32_t pair0 = gather_words[row + 0];
-                    const uint32_t pair1 = gather_words[row + 1];
-                    const uint32_t pair2 = gather_words[row + 2];
-                    const uint32_t pair3 = gather_words[row + 3];
+                const HVX_Vector v_pair = hvx_vmem(gather_words);
+                const HVX_Vector v4  = Q6_Vuw_vlsr_VuwR(v_pair, 4);
+                const HVX_Vector v8  = Q6_Vuw_vlsr_VuwR(v_pair, 8);
+                const HVX_Vector v16 = Q6_Vuw_vlsr_VuwR(v_pair, 16);
+                const HVX_Vector v20 = Q6_Vuw_vlsr_VuwR(v_pair, 20);
+                const HVX_Vector v24 = Q6_Vuw_vlsr_VuwR(v_pair, 24);
+                const HVX_Vector mask_lo = Q6_V_vsplat_R(0x0000000f);
+                const HVX_Vector mask_hi = Q6_V_vsplat_R(0x000000f0);
 
-                    const uint32_t lo01_rows = htp_raw_q4_0_pack_4rows(
-                        htp_raw_q4_0_pair_lo01(pair0), htp_raw_q4_0_pair_lo01(pair1),
-                        htp_raw_q4_0_pair_lo01(pair2), htp_raw_q4_0_pair_lo01(pair3));
-                    const uint32_t hi01_rows = htp_raw_q4_0_pack_4rows(
-                        htp_raw_q4_0_pair_hi01(pair0), htp_raw_q4_0_pair_hi01(pair1),
-                        htp_raw_q4_0_pair_hi01(pair2), htp_raw_q4_0_pair_hi01(pair3));
-                    const uint32_t lo23_rows = htp_raw_q4_0_pack_4rows(
-                        htp_raw_q4_0_pair_lo23(pair0), htp_raw_q4_0_pair_lo23(pair1),
-                        htp_raw_q4_0_pair_lo23(pair2), htp_raw_q4_0_pair_lo23(pair3));
-                    const uint32_t hi23_rows = htp_raw_q4_0_pack_4rows(
-                        htp_raw_q4_0_pair_hi23(pair0), htp_raw_q4_0_pair_hi23(pair1),
-                        htp_raw_q4_0_pair_hi23(pair2), htp_raw_q4_0_pair_hi23(pair3));
+                HVX_Vector packed = Q6_V_vor_VV(
+                    Q6_V_vand_VV(v_pair, mask_lo), Q6_V_vand_VV(v4, mask_hi));
+                hvx_vec_store_u(tile + qp * 32, 32, htp_raw_q4_0_compact_word_lsb(packed));
 
-                    memcpy(tile + qp * 32 + row, &lo01_rows, sizeof(lo01_rows));
-                    memcpy(tile + (qp + 8) * 32 + row, &hi01_rows, sizeof(hi01_rows));
-                    memcpy(tile + (qp + 1) * 32 + row, &lo23_rows, sizeof(lo23_rows));
-                    memcpy(tile + (qp + 9) * 32 + row, &hi23_rows, sizeof(hi23_rows));
-                }
+                packed = Q6_V_vor_VV(
+                    Q6_V_vand_VV(v4, mask_lo), Q6_V_vand_VV(v8, mask_hi));
+                hvx_vec_store_u(tile + (qp + 8) * 32, 32, htp_raw_q4_0_compact_word_lsb(packed));
+
+                packed = Q6_V_vor_VV(
+                    Q6_V_vand_VV(v16, mask_lo), Q6_V_vand_VV(v20, mask_hi));
+                hvx_vec_store_u(tile + (qp + 1) * 32, 32, htp_raw_q4_0_compact_word_lsb(packed));
+
+                packed = Q6_V_vor_VV(
+                    Q6_V_vand_VV(v20, mask_lo), Q6_V_vand_VV(v24, mask_hi));
+                hvx_vec_store_u(tile + (qp + 9) * 32, 32, htp_raw_q4_0_compact_word_lsb(packed));
             }
 
             uint8_t * scale_dst = tile + 512;

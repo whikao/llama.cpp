@@ -159,10 +159,16 @@ addressing correction.
 
 The v10.28 phone run generated the correct `你好` token in 14.036 seconds and
 matched the full scalar reference. Its 135 profile records still attributed
-8.323 of 8.605 MMID seconds (96.723%) to raw-to-tiled conversion. v10.29 keeps
-the verified gather addresses and byte equations, but packs four gathered rows
-into each 32-bit scalar store. This reduces the gather post-processing loop and
-store count by 4x without adding a new HVX permutation or memory allocation.
+8.323 of 8.605 MMID seconds (96.723%) to raw-to-tiled conversion. v10.29 tried
+packing four gathered rows per scalar iteration, but the phone result regressed
+to 25.163 seconds and 18.026 raw-to-tiled seconds despite remaining correct.
+That fully-unrolled scalar experiment is rejected.
+
+v10.30 keeps the v10.28 gather addresses and exact byte equations, but performs
+the post-processing in HVX registers. Word shifts and masks form each packed
+Q4_0 byte, two byte-deal operations compact byte 0 of every 32-bit row word,
+and a predicated vector store writes the 32 rows. It adds no buffer and retains
+the existing scalar fallback for partial-row tiles.
 
 The v10.21 diagnostic controls can switch the MMID activation quantizer without
 another GitHub Actions build. For a focused A/B run, use one of:

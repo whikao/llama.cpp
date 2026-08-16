@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.29 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.30 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,17 +6,23 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
-- v10.29 keeps the verified v10.28 HVX word gather and its exact byte
-  equations, then handles four gathered rows per scalar iteration. Four
-  adjacent output bytes are assembled into one 32-bit value and written with
-  one store, reducing the gather post-processing loop and scalar store count
-  by 4x. It deliberately avoids an unverified HVX byte permutation.
+- v10.30 removes the gather post-processing scalar row loop. The verified
+  v10.28 gathered words remain in HVX registers; word shifts plus masks form
+  the same four Q4_0 packed-byte equations, and two byte `vdeal` operations
+  compact byte 0 of all 32 words into row order. Each result is written with
+  one 32-byte predicated vector store. Gather addressing and memory use are
+  unchanged.
+- v10.29 remained correct but is rejected for performance. It generated `你好`
+  with all 28 slices finite, yet prompt evaluation rose from 14.036 to 25.163
+  seconds. Across the same 135 records and 4,797 experts, raw-to-tiled rose
+  from 8.323 to 18.026 seconds. The four-row scalar packing and full unroll
+  increased instruction/register pressure instead of improving the converter.
 - The v10.28 phone run is correct and fast: exit code `0`, generated token
   `你好`, all 28 diagnostic slices finite, and the first full reference differs
   by only `-5.36e-09`. Prompt evaluation fell from the correct v10.26 result
   of 43.044 seconds to 14.036 seconds (3.07x faster). Across 135 profile
   records and 4,797 selected-expert calls, raw-to-tiled conversion still used
-  8.323 of 8.605 MMID seconds (96.723%), which is the v10.29 target.
+  8.323 of 8.605 MMID seconds (96.723%), which remains the v10.30 target.
 - v10.28 fixes the v10.27 gather address observed on the phone. Passing
   `raw + 2` as the word-gather base caused the target to round the base down
   and gather Q4_0 scale bytes: the first packed byte became `0xd4` from scale
@@ -98,7 +104,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.29.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.30.tar.gz -C .
 git diff --check
 git status --short
 ```
