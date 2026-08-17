@@ -1366,9 +1366,16 @@ static inline __attribute__((always_inline)) void htp_raw_q4_0_32rows_to_tiled(
             const HVX_Vector v_scale_words = hvx_vmem(gather_words);
             const HVX_Vector v_scales = Q6_Vh_vdeal_Vh(v_scale_words);
             uint8_t * scale_dst = tile + 512;
-            hvx_vec_store_u(scale_dst, 64, v_scales);
-            memset(tile + HTP_MM_WEIGHT_TILE_SIZE_Q4_0, 0,
-                   HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0 - HTP_MM_WEIGHT_TILE_SIZE_Q4_0);
+            // v10.43: the lower 64 bytes contain all 32 fp16 scales and the
+            // upper 64 bytes are alignment padding. Form the exact padded
+            // vector and write it once instead of a predicated 64-byte store
+            // followed by a separate 64-byte memset. The scale remains in
+            // scratch exactly as in v10.41, so the fused dot has identical
+            // register pressure and reads the byte-identical 128-byte vector.
+            const HVX_VectorPred q_scale_bytes = Q6_Q_vsetq_R(64);
+            const HVX_Vector v_scale_padded =
+                Q6_V_vand_QV(q_scale_bytes, v_scales);
+            hvx_vmem(scale_dst) = v_scale_padded;
             continue;
         }
 
@@ -1425,76 +1432,6 @@ static inline __attribute__((always_inline)) void htp_raw_q4_0_32rows_to_tiled(
     }
 }
 
-// v10.42: full-row converter for the fused path. The four Q vectors still use
-// the byte-identical v10.28/v10.30 gather and packing equations, but the fp16
-// scales are returned in an HVX register. The fused consumer therefore does
-// not store 64 scale bytes, clear 64 alignment bytes, and reload that 128-byte
-// scale/tail vector for every K tile. The final scale gather temporarily uses
-// tiled_scratch[512..639], exactly as the verified generic converter does.
-static inline __attribute__((always_inline)) HVX_Vector
-htp_raw_q4_0_32rows_to_fused_q_scales(
-        const uint8_t * restrict raw,
-        size_t raw_row_size,
-        uint8_t * restrict tiled_scratch,
-        HVX_Vector v_raw_row_offsets,
-        uint32_t kt) {
-    uint32_t * gather_words = (uint32_t *) (tiled_scratch + 512);
-    const uint32_t gather_region = (uint32_t) (32 * raw_row_size - 1);
-
-    #pragma unroll(4)
-    for (uint32_t group = 0; group < 4; ++group) {
-        const uint32_t group_offset =
-            kt * HTP_RAW_Q4_0_BLOCK_BYTES + 2 + group * 4;
-        const HVX_Vector v_group_offsets = Q6_Vw_vadd_VwVw(
-            v_raw_row_offsets, Q6_V_vsplat_R((int) group_offset));
-        Q6_vgather_ARMVw(
-            (HVX_Vector *) gather_words,
-            (size_t) raw,
-            gather_region,
-            v_group_offsets);
-
-        const uint32_t qp = 2 * group;
-        const HVX_Vector v_pair = hvx_vmem(gather_words);
-        const HVX_Vector v4  = Q6_Vuw_vlsr_VuwR(v_pair, 4);
-        const HVX_Vector v8  = Q6_Vuw_vlsr_VuwR(v_pair, 8);
-        const HVX_Vector v16 = Q6_Vuw_vlsr_VuwR(v_pair, 16);
-        const HVX_Vector v20 = Q6_Vuw_vlsr_VuwR(v_pair, 20);
-        const HVX_Vector v24 = Q6_Vuw_vlsr_VuwR(v_pair, 24);
-        const HVX_Vector mask_lo = Q6_V_vsplat_R(0x0000000f);
-        const HVX_Vector mask_hi = Q6_V_vsplat_R(0x000000f0);
-
-        HVX_Vector packed = Q6_V_vor_VV(
-            Q6_V_vand_VV(v_pair, mask_lo), Q6_V_vand_VV(v4, mask_hi));
-        hvx_vec_store_u(tiled_scratch + qp * 32, 32,
-                        htp_raw_q4_0_compact_word_lsb(packed));
-
-        packed = Q6_V_vor_VV(
-            Q6_V_vand_VV(v4, mask_lo), Q6_V_vand_VV(v8, mask_hi));
-        hvx_vec_store_u(tiled_scratch + (qp + 8) * 32, 32,
-                        htp_raw_q4_0_compact_word_lsb(packed));
-
-        packed = Q6_V_vor_VV(
-            Q6_V_vand_VV(v16, mask_lo), Q6_V_vand_VV(v20, mask_hi));
-        hvx_vec_store_u(tiled_scratch + (qp + 1) * 32, 32,
-                        htp_raw_q4_0_compact_word_lsb(packed));
-
-        packed = Q6_V_vor_VV(
-            Q6_V_vand_VV(v20, mask_lo), Q6_V_vand_VV(v24, mask_hi));
-        hvx_vec_store_u(tiled_scratch + (qp + 9) * 32, 32,
-                        htp_raw_q4_0_compact_word_lsb(packed));
-    }
-
-    const uint32_t scale_offset = kt * HTP_RAW_Q4_0_BLOCK_BYTES;
-    const HVX_Vector v_scale_offsets = Q6_Vw_vadd_VwVw(
-        v_raw_row_offsets, Q6_V_vsplat_R((int) scale_offset));
-    Q6_vgather_ARMVw(
-        (HVX_Vector *) gather_words,
-        (size_t) raw,
-        gather_region,
-        v_scale_offsets);
-    return Q6_Vh_vdeal_Vh(hvx_vmem(gather_words));
-}
-
 // v10.41: targeted decode fast path for one expert mapping. Convert one K
 // tile into the existing 640-byte scratch slot and consume it immediately,
 // keeping the fp32 row accumulator in HVX registers across all K tiles. This
@@ -1514,10 +1451,9 @@ static void htp_raw_q4_0_32rows_fused_dot_32x1(
     const uint32_t n_k_tiles = k / 32;
 
     for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
-        const HVX_Vector v_scale_w =
-            htp_raw_q4_0_32rows_to_fused_q_scales(
-                raw, raw_row_size, tiled_scratch,
-                v_raw_row_offsets, kt);
+        htp_raw_q4_0_32rows_to_tiled(
+            raw, raw_row_size, tiled_scratch, k, valid_rows,
+            v_raw_row_offsets, kt, 1);
 
         const HVX_Vector * restrict vptr =
             (const HVX_Vector *) tiled_scratch;
@@ -1527,7 +1463,7 @@ static void htp_raw_q4_0_32rows_fused_dot_32x1(
         const HVX_Vector v_sum = accum_4bit_32x1(vptr, v_act, i8);
         const HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
         const HVX_Vector v_scale_comb =
-            hvx_vec_mul_f16_f16_to_f32_lower32(v_scale_w, v_act[8]);
+            hvx_vec_mul_f16_f16_to_f32_lower32(vptr[4], v_act[8]);
         const HVX_Vector v_sum_scaled =
             hvx_vec_mul_f32_f32(v_sum_sf, v_scale_comb);
         v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_sum_scaled);

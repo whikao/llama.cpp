@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.42 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.43 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,15 +6,16 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
-- v10.42 follows the successful v10.41 phone A/B without widening its guard.
-  The deterministic 8-token output matched the 32-token prefix, both runs
-  exited zero, and the 32-token result improved from v10.40's 1.99 t/s to
-  2.17 t/s. Inside that same K=768, N=2048 fused path, the converter now
-  returns the 32 fp16 weight scales in an HVX register. It no longer stores
-  the 64 scale bytes, clears the unused 64-byte alignment tail, and reloads
-  the 128-byte scale/tail vector for each of 24 K tiles. Q-byte gathers,
-  packing equations, K order and fp32 accumulation are unchanged. Every
-  non-fused case retains the byte-identical v10.41/v10.40 fallback.
+- v10.43 returns to the accepted v10.41 source; none of the rejected v10.42
+  register-scale code is present. v10.42 remained numerically correct but fell
+  to 1.38 t/s for 8 tokens and 1.76 t/s for 32 tokens, consistent with extra
+  HVX register pressure/spills. v10.43 leaves the scale in the original
+  scratch vector. For every full 32-row Q4_0 tile it masks the upper 64 padding
+  bytes to zero and performs one aligned 128-byte store, replacing v10.41's
+  predicated 64-byte scale store plus separate 64-byte memset. The resulting
+  640-byte tiled block, dot inputs, accumulation order and fast-path guard are
+  byte-identical to v10.41. This also benefits full-row generic conversion
+  without adding a live register across the dot kernel.
 - v10.41 adds a narrowly guarded fused down path. For the verified raw-Q4_0
   shape K=768, N=2048 with 32 valid output rows and exactly one mapping for
   the selected expert, each 640-byte tiled K block is consumed immediately by
@@ -253,7 +254,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.42.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.43.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -267,8 +268,8 @@ Android Hexagon workflow. After it succeeds, install the new rolling release:
 "$HOME/phone-debug.sh" status
 ```
 
-First run one deterministic 8-token correctness check because v10.42 removes
-the fused path's scale-vector round trip. Keep all debug profilers disabled so
+First run one deterministic 8-token correctness check because v10.43 changes
+the scale/tail store. Keep all debug profilers disabled so
 the fused production path is selected. The rejected exact-address cache stays
 off and four host-copy workers remain the normal setting:
 
@@ -282,7 +283,8 @@ GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
 
 Attach the generated `share-this.tar.gz`. The output must match the deterministic
 v10.41 prefix and exit with code zero. If correct, repeat with `TOKENS=32` and
-compare against the v10.41 control of 14.769 seconds / 2.17 t/s.
+compare against the v10.41 control of 14.769 seconds / 2.17 t/s. Do not use
+v10.42 as the performance baseline.
 There should be no `DBG_V138_HVX_RAW_DOWN_PROFILE` line while `MMID_DEBUG=0`.
 Eight host-copy workers remain an optional later burst test; do not mix that
 variable into this validation.
