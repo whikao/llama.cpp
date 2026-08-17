@@ -193,6 +193,13 @@ kernel unchanged and adds `DBG_V132_HOST_SET`, `HOST_GET`, `HOST_GRAPH` and
 `HOST_SYNC` elapsed-time records. They identify whether the next target is
 sparse expert transfer, graph execution or synchronization.
 
+v10.42 keeps the exact v10.41 guard and Q-byte equations. In the fused path it
+returns the gathered fp16 scales in an HVX register instead of storing 64
+scale bytes, clearing the 64-byte alignment tail, and reloading the complete
+128-byte scale/tail vector for every K tile. The v10.41 deterministic checks
+matched prefixes and exited zero; its 32-token result reached 2.17 t/s versus
+v10.40's 1.99 t/s. All fallback cases remain unchanged.
+
 v10.41 targets the verified K=768, N=2048, full-32-row, single-mapping down
 case. It converts one K tile into the existing 640-byte scratch slot, consumes
 it immediately with the existing Q4_0/Q8_0 dot, and retains the fp32 sum in HVX
