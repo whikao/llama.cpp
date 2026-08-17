@@ -1,4 +1,4 @@
-# Hexagon HMX raw-Q4_0 MMID v10.40 phone overlay
+# Hexagon HMX raw-Q4_0 MMID v10.41 phone overlay
 
 This overlay is for `whikao/llama.cpp`. Extract it from the repository root.
 The apply-note filename is retained so extraction cleanly updates the tracked
@@ -6,6 +6,15 @@ v10.21 note instead of leaving another stale file.
 
 ## What changes
 
+- v10.41 adds a narrowly guarded fused down path. For the verified raw-Q4_0
+  shape K=768, N=2048 with 32 valid output rows and exactly one mapping for
+  the selected expert, each 640-byte tiled K block is consumed immediately by
+  the existing Q4_0/Q8_0 dot and the fp32 output accumulator remains in HVX
+  registers across all 24 K blocks. This avoids materializing and rereading
+  the full 15,360-byte tiled intermediate per row tile. The converter's gather
+  addresses and packed bytes and the dot's integer/fp16/fp32 equations are
+  unchanged and execute in the same K order. Other shapes, duplicate expert
+  mappings, partial row tiles, and `MMID_DEBUG=1` retain the exact v10.40 path.
 - v10.40 targets raw-to-tiled bookkeeping without changing the verified
   converter equations. v10.38 observed 512 converted 32-row blocks per real
   `768:8` down call. Each block invocation rebuilt the same 32 gather row
@@ -235,7 +244,7 @@ v10.21 note instead of leaving another stale file.
 
 ```bash
 cd "$HOME/whikao-llama.cpp"
-tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.40.tar.gz -C .
+tar -xzf /sdcard/Download/llama-hexagon-hmx-raw-mmid-v10.41.tar.gz -C .
 git diff --check
 git status --short
 ```
@@ -249,24 +258,25 @@ Android Hexagon workflow. After it succeeds, install the new rolling release:
 "$HOME/phone-debug.sh" status
 ```
 
-Run one deterministic 32-token production-path validation. Keep all debug
-profilers disabled so the v10.39 cleanup remains active. The rejected exact-address
-cache stays off and four host-copy workers remain the normal setting:
+First run one deterministic 8-token correctness check because v10.41 changes
+the lifetime of the tiled intermediate. Keep all debug profilers disabled so
+the fused production path is selected. The rejected exact-address cache stays
+off and four host-copy workers remain the normal setting:
 
 ```bash
 termux-wake-lock
-PROMPT='请用一句话介绍你自己。' TOKENS=32 HOST_COPY_THREADS=4 \
+PROMPT='请用一句话介绍你自己。' TOKENS=8 HOST_COPY_THREADS=4 \
 EXPERT_COPY_CACHE=0 ROUTE_PROFILE=0 PROFILE_MODE=0 \
 GGML_HEXAGON_VERBOSE=0 TRACE_START='' \
   "$HOME/phone-debug.sh" run htp --seed 1234 --temp 0
 ```
 
-Attach the generated `share-this.tar.gz`. There should be no
-`DBG_V138_HVX_RAW_DOWN_PROFILE` line while `MMID_DEBUG=0`; its absence confirms
-the timers and old correctness probes are out of the production path. Compare
-the 32-token generation time with the v10.35.1/v10.37 controls. Eight host-copy
-workers remain an optional later burst test; do not mix that variable into this
-validation.
+Attach the generated `share-this.tar.gz`. The output must match the deterministic
+v10.39/v10.40 prefix and exit with code zero. If correct, repeat with
+`TOKENS=32` and compare against the v10.40 control of 16.050 seconds / 1.99 t/s.
+There should be no `DBG_V138_HVX_RAW_DOWN_PROFILE` line while `MMID_DEBUG=0`.
+Eight host-copy workers remain an optional later burst test; do not mix that
+variable into this validation.
 
 For ordinary runs leave `ROUTE_PROFILE=0` and `EXPERT_COPY_CACHE=0`. If the
 cache test is wrong or slower, leave it at zero. If parallel copying is wrong

@@ -193,6 +193,12 @@ kernel unchanged and adds `DBG_V132_HOST_SET`, `HOST_GET`, `HOST_GRAPH` and
 `HOST_SYNC` elapsed-time records. They identify whether the next target is
 sparse expert transfer, graph execution or synchronization.
 
+v10.41 targets the verified K=768, N=2048, full-32-row, single-mapping down
+case. It converts one K tile into the existing 640-byte scratch slot, consumes
+it immediately with the existing Q4_0/Q8_0 dot, and retains the fp32 sum in HVX
+registers across all 24 K tiles. Other shapes and debug runs automatically use
+the v10.40 path. No model-sized allocation or additional VTCM buffer is added.
+
 v10.40 keeps the converter's verified Q4_0 byte equations and hoists its
 32-element gather-offset construction from every 32-row block to once per
 worker. The real down path converted 512 such blocks per call in v10.38, so

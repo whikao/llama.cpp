@@ -1267,22 +1267,23 @@ static inline HVX_Vector htp_raw_q4_0_make_row_offsets(
     return *(const HVX_Vector *) raw_row_offsets;
 }
 
-static void htp_raw_q4_0_32rows_to_tiled(
+static inline __attribute__((always_inline)) void htp_raw_q4_0_32rows_to_tiled(
         const uint8_t * restrict raw,
         size_t raw_row_size,
         uint8_t * restrict tiled,
         uint32_t k,
         uint32_t valid_rows,
-        HVX_Vector v_raw_row_offsets) {
-    const uint32_t n_k_tiles = k / 32;
-
-    for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
+        HVX_Vector v_raw_row_offsets,
+        uint32_t first_k_tile,
+        uint32_t tile_count) {
+    for (uint32_t ti = 0; ti < tile_count; ++ti) {
+        const uint32_t kt = first_k_tile + ti;
         // v10.10 correctness fix:
         // The Q4_0 dot kernel advances weight tiles at the aligned 640-byte
         // stride, while this raw converter previously packed them every 576
         // bytes. kt=0 therefore looked correct in our hashes, but kt>=1 was
         // read from the wrong address.
-        uint8_t * tile = tiled + kt * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
+        uint8_t * tile = tiled + ti * HTP_MM_WEIGHT_ALIGNED_TILE_SIZE_Q4_0;
 
         // v10.26: walk each raw block once instead of revisiting it through 16
         // column-pair passes. A raw Q4_0 byte contains q[j] in its low nibble
@@ -1424,6 +1425,46 @@ static void htp_raw_q4_0_32rows_to_tiled(
     }
 }
 
+// v10.41: targeted decode fast path for one expert mapping. Convert one K
+// tile into the existing 640-byte scratch slot and consume it immediately,
+// keeping the fp32 row accumulator in HVX registers across all K tiles. This
+// uses the verified converter and dot equations; only the lifetime of the
+// tiled intermediate changes.
+static void htp_raw_q4_0_32rows_fused_dot_32x1(
+        const uint8_t * restrict raw,
+        size_t raw_row_size,
+        uint8_t * restrict tiled_scratch,
+        uint32_t k,
+        uint32_t valid_rows,
+        HVX_Vector v_raw_row_offsets,
+        const uint8_t * restrict y_q,
+        float * restrict dst) {
+    HVX_Vector v_sum_float = Q6_V_vzero();
+    const HVX_Vector i8 = Q6_Vb_vsplat_R(8);
+    const uint32_t n_k_tiles = k / 32;
+
+    for (uint32_t kt = 0; kt < n_k_tiles; ++kt) {
+        htp_raw_q4_0_32rows_to_tiled(
+            raw, raw_row_size, tiled_scratch, k, valid_rows,
+            v_raw_row_offsets, kt, 1);
+
+        const HVX_Vector * restrict vptr =
+            (const HVX_Vector *) tiled_scratch;
+        const HVX_Vector * restrict v_act =
+            (const HVX_Vector *) (y_q + (size_t) kt * HTP_MM_ACT_TILE_SIZE_Q8_0);
+
+        const HVX_Vector v_sum = accum_4bit_32x1(vptr, v_act, i8);
+        const HVX_Vector v_sum_sf = Q6_Vsf_equals_Vw(v_sum);
+        const HVX_Vector v_scale_comb =
+            hvx_vec_mul_f16_f16_to_f32_lower32(vptr[4], v_act[8]);
+        const HVX_Vector v_sum_scaled =
+            hvx_vec_mul_f32_f32(v_sum_sf, v_scale_comb);
+        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_sum_scaled);
+    }
+
+    hvx_vec_store_u(dst, valid_rows * sizeof(float), v_sum_float);
+}
+
 // v10.24: parallelize the low-memory raw-Q4_0 layout transform by assigning
 // independent 32-row output tiles to the HTP worker pool.  Each worker writes
 // a disjoint [row-tile, all-K-tiles] range, so the byte layout is identical to
@@ -1458,7 +1499,9 @@ static void htp_raw_q4_0_to_tiled_worker(
             state->tiled + rt * state->tiled_32_rows,
             state->k,
             valid_rows,
-            v_raw_row_offsets);
+            v_raw_row_offsets,
+            0,
+            state->k / 32);
     }
 }
 
@@ -1619,12 +1662,38 @@ static void hvx_mm_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
                 dma_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
             }
 
+            // v10.41: Qwen3 decode selects each expert at most once for this
+            // eight-row MMID call. For that common down shape, consume each
+            // converted K tile immediately and retain the fp32 accumulator in
+            // registers. Any duplicate mapping, partial output tile, other
+            // shape, or enabled correctness probe uses the unchanged path.
+            if (!mmctx->dbg_v112_enabled && cne1 == 1 &&
+                ne00 == 768 && ne01 == 2048 && valid_rows == 32) {
+                const struct mmid_row_mapping row_mapping =
+                    MMID_MATRIX_ROW(cur_a, 0);
+                const int rm1 = row_mapping.i1;
+                const int rm2 = row_mapping.i2;
+                const uint32_t ir1 =
+                    fastmodulo(rm1, ne11, &mmctx->mm_div_ne11);
+                const uint8_t * restrict src1_col =
+                    src1_data + (ir1 + rm2 * ne11) * src1_stride;
+                float * restrict dst_row =
+                    (float *) (dst->data + (rm1 * nb1 + rm2 * nb2));
+
+                htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+                htp_raw_q4_0_32rows_fused_dot_32x1(
+                    raw_buf, raw_row_size, tiled_buf, ne00, valid_rows,
+                    v_raw_row_offsets, src1_col, &dst_row[ct * 32]);
+                htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, ct);
+                continue;
+            }
+
             // Convert only this working set; no model-sized REPACK allocation.
             phase_start_qt =
                 profile_down ? HAP_perf_get_qtimer_count() : 0;
             htp_raw_q4_0_32rows_to_tiled(
                 raw_buf, raw_row_size, tiled_buf, ne00, valid_rows,
-                v_raw_row_offsets);
+                v_raw_row_offsets, 0, ne00 / 32);
             if (profile_down) {
                 convert_qt += HAP_perf_get_qtimer_count() - phase_start_qt;
                 ++tile_count;
@@ -2336,7 +2405,7 @@ static void hvx_mv_id_raw_q4_0(unsigned int nth, unsigned int ith, void * data) 
             (void) dma_queue_pop(dma_queue);
             htp_raw_q4_0_32rows_to_tiled(
                 raw_buf, raw_row_size, tiled_buf, ne00, valid_rows,
-                v_raw_row_offsets);
+                v_raw_row_offsets, 0, ne00 / 32);
 
             htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, ct);
             tiled_vec_dot_q4_0_32x1(
